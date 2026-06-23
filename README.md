@@ -4,6 +4,8 @@ Kontrol perangkat dalam jaringan WiFi dari terminal. Lihat siapa saja yang terhu
 
 Mirip NetCut, gratis dan open source.
 
+**Disclaimer:** Alat ini hanya untuk pembelajaran dan penggunaan pada jaringan yang menjadi milik Anda sendiri. Penggunaan pada jaringan orang lain tanpa izin dapat melanggar hukum. Penulis tidak bertanggung jawab atas penyalahgunaan alat ini.
+
 ## Fitur
 
 - Scan jaringan, deteksi perangkat (IP, MAC, vendor, hostname)
