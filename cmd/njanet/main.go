@@ -46,6 +46,8 @@ func main() {
 		cmdDashboard(ifaceName)
 	case "list", "ls":
 		cmdList(ifaceName)
+	case "protect":
+		cmdProtect(ifaceName)
 	case "rename", "name":
 		cmdRename(ifaceName)
 	case "block":
@@ -81,6 +83,7 @@ Usage:
   njanet unblock <mac/ip>  Unblock device
   njanet throttle <mac/ip> <speed_kbps>  Limit bandwidth
   njanet rename <ip> <name>  Set device nickname
+  njanet protect           Manage protected IPs (excluded from hog)
   njanet hog <speed>       Throttle ALL devices except you
   njanet stats             Show network stats
   njanet reset             Reset all rules
@@ -260,6 +263,113 @@ func cmdList(ifaceName string) {
 			truncate(dev.DeviceType, 15), status)
 	}
 	fmt.Printf("\n%d devices total\n", len(devices))
+}
+
+func cmdProtect(ifaceName string) {
+	database := initDB()
+	defer database.Close()
+
+	if len(os.Args) < 3 {
+		macs, _ := database.GetProtectedMACs()
+		if len(macs) == 0 {
+			fmt.Println("No protected devices.")
+			fmt.Println("Usage: njanet protect add <ip> [label]")
+			fmt.Println("       njanet protect remove <ip>")
+			fmt.Println("       njanet protect list")
+			return
+		}
+		fmt.Println("Protected devices (excluded from hog):")
+		for _, m := range macs {
+			devices, _ := database.GetAllDevices()
+			label := m
+			for _, d := range devices {
+				if d.MAC == m {
+					label = fmt.Sprintf("%s (%s)", d.Nickname, d.IP)
+					if d.Nickname == "" {
+						label = fmt.Sprintf("%s (%s)", d.Hostname, d.IP)
+					}
+					break
+				}
+			}
+			fmt.Printf("  - %s\n", label)
+		}
+		return
+	}
+
+	sub := os.Args[2]
+	switch sub {
+	case "add":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: njanet protect add <ip>")
+			return
+		}
+		target := os.Args[3]
+		label := ""
+		if len(os.Args) >= 5 {
+			label = os.Args[4]
+		}
+
+		// Try to resolve IP to MAC
+		mac, err := database.FindMACByIP(target)
+		if err == nil && mac != "" {
+			database.AddProtectedMAC(mac, label)
+			fmt.Printf("Protected: %s (MAC: %s)\n", target, mac)
+		} else if len(target) == 17 && strings.Contains(target, ":") {
+			// It's already a MAC
+			database.AddProtectedMAC(target, label)
+			fmt.Printf("Protected: %s\n", target)
+		} else {
+			// Unknown device, just use IP
+			database.AddProtectedMAC(target, label)
+			fmt.Printf("Protected: %s (IP based - may not work across networks)\n", target)
+		}
+
+	case "remove", "rm", "delete":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: njanet protect remove <ip>")
+			return
+		}
+		target := os.Args[3]
+		// Remove by MAC and by IP (for backward compatibility)
+		mac, _ := database.FindMACByIP(target)
+		if mac != "" {
+			database.RemoveProtectedMAC(mac)
+		}
+		database.RemoveProtectedByIP(target)
+		fmt.Printf("Removed protection: %s\n", target)
+
+	case "list", "ls":
+		macs, _ := database.GetProtectedMACs()
+		if len(macs) == 0 {
+			fmt.Println("No protected devices.")
+			return
+		}
+		fmt.Println("Protected devices:")
+		for _, m := range macs {
+			devices, _ := database.GetAllDevices()
+			label := m
+			for _, d := range devices {
+				if d.MAC == m {
+					name := d.Nickname
+					if name == "" {
+						name = d.Hostname
+					}
+					if name != "" {
+						label = fmt.Sprintf("%s (%s - %s)", name, d.IP, m)
+					} else {
+						label = fmt.Sprintf("%s (%s)", d.IP, m)
+					}
+					break
+				}
+			}
+			fmt.Printf("  - %s\n", label)
+		}
+
+	default:
+		fmt.Println("Usage: njanet protect add <ip> [label]")
+		fmt.Println("       njanet protect remove <ip>")
+		fmt.Println("       njanet protect list")
+	}
 }
 
 func cmdRename(ifaceName string) {
@@ -551,16 +661,30 @@ func cmdHog(ifaceName string) {
 
 	ctrl := initController(ifaceName)
 
+	// Load protected IPs
+	protectedMACs, _ := database.GetProtectedMACs()
+	protected := make(map[string]bool)
+	for _, mac := range protectedMACs {
+		protected[mac] = true
+	}
+	if len(protectedMACs) > 0 {
+		fmt.Printf("   Protected: %v\n", protectedMACs)
+	}
+
 	count := 0
 	for _, dev := range result.Devices {
 		if dev.IP == myIP {
 			fmt.Printf("   ⏭️  Skip: %s (your device)\n", dev.IP)
 			continue
 		}
+		if protected[dev.IP] {
+			fmt.Printf("   Skip: %s (protected)\n", dev.IP)
+			continue
+		}
 		if dev.MAC == "00:00:00:00:00:00" {
 			continue
 		}
-		fmt.Printf("   🐢 Throttling %s -> %d Kbps\n", dev.IP, speed)
+		fmt.Printf("   Throttling %s -> %d Kbps\n", dev.IP, speed)
 		ctrl.ThrottleDevice(dev, speed)
 		database.UpdateDeviceSpeed(dev.MAC, speed)
 		count++
@@ -578,6 +702,9 @@ func cmdHog(ifaceName string) {
 	fmt.Println("\n🔄 Restoring all devices...")
 	for _, dev := range result.Devices {
 		if dev.IP == myIP || dev.MAC == "00:00:00:00:00:00" {
+			continue
+		}
+		if protected[dev.IP] {
 			continue
 		}
 		ctrl.ThrottleDevice(dev, 0)

@@ -102,6 +102,13 @@ func (d *Database) migrate() error {
 		total_devices INTEGER DEFAULT 0,
 		online_devices INTEGER DEFAULT 0
 	);
+
+	CREATE TABLE IF NOT EXISTS protected_ips (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		ip TEXT NOT NULL UNIQUE,
+		label TEXT DEFAULT '',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
 	`
 	_, err := d.Exec(schema)
 	return err
@@ -301,6 +308,56 @@ func (d *Database) GetBlockRules() ([]*BlockRule, error) {
 		rules = append(rules, r)
 	}
 	return rules, nil
+}
+
+
+// --- Protected Devices (by MAC) ---
+
+func (d *Database) AddProtectedMAC(mac, label string) error {
+	_, err := d.Exec("INSERT OR IGNORE INTO protected_ips (ip, label) VALUES (?, ?)", mac, label)
+	return err
+}
+
+func (d *Database) RemoveProtectedMAC(mac string) error {
+	// Remove by exact MAC
+	_, err := d.Exec("DELETE FROM protected_ips WHERE ip = ?", mac)
+	// Also try removing by IP (for backward compatibility)
+	d.Exec("DELETE FROM protected_ips WHERE ip = ?", mac)
+	return err
+}
+
+func (d *Database) RemoveProtectedByIP(ip string) error {
+	_, err := d.Exec("DELETE FROM protected_ips WHERE ip = ?", ip)
+	return err
+}
+
+func (d *Database) GetProtectedMACs() ([]string, error) {
+	rows, err := d.Query("SELECT ip FROM protected_ips ORDER BY created_at")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var macs []string
+	for rows.Next() {
+		var mac string
+		if err := rows.Scan(&mac); err != nil {
+			return nil, err
+		}
+		macs = append(macs, mac)
+	}
+	return macs, nil
+}
+
+func (d *Database) FindMACByIP(ip string) (string, error) {
+	var mac string
+	err := d.QueryRow("SELECT mac FROM devices WHERE ip = ?", ip).Scan(&mac)
+	return mac, err
+}
+
+func (d *Database) IsProtectedMAC(mac string) (bool, error) {
+	var count int
+	err := d.QueryRow("SELECT COUNT(*) FROM protected_ips WHERE ip = ?", mac).Scan(&count)
+	return count > 0, err
 }
 
 // --- Scan History ---
