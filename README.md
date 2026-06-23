@@ -17,14 +17,14 @@ Mirip kayak **NetCut**, tapi **gratis, open source, dan buat Linux**.
 
 ```bash
 # 1. Download / clone
-git clone https://github.com/mectov/netctl
-cd netctl
+git clone https://github.com/mectov/njanet
+cd njanet
 
 # 2. Build
-go build -o netctl cmd/netctl/main.go
+go build -o njanet cmd/njanet/main.go
 
-# 3. Install ke PATH (biar tinggal ketik "netctl")
-sudo cp netctl /usr/local/bin/
+# 3. Install ke PATH (biar tinggal ketik "njanet")
+sudo cp njanet /usr/local/bin/
 
 # 4. Install ARP spoof tool (WAJIB buat block/throttle)
 sudo apt install dsniff -y
@@ -35,7 +35,7 @@ sudo apt install dsniff -y
 ### 1. Scan — Lihat siapa aja yang terhubung ke WiFi
 
 ```bash
-sudo netctl scan
+sudo njanet scan
 ```
 
 Contoh hasil:
@@ -46,7 +46,7 @@ Contoh hasil:
    Devices found: 8 (8 online)
 
 IP               MAC                Hostname       Vendor        Status
-192.168.1.10     0C:9D:92:3F:07:D6  netctl-host    ASUS          🟢
+192.168.1.10     0C:9D:92:3F:07:D6  njanet-host    ASUS          🟢
 192.168.1.1      D0:04:92:18:9F:D8  _gateway       Fiberhome     🟢
 192.168.1.8      72:86:B5:64:81:6F  -              Unknown       🟢
 192.168.1.200    64:1C:AE:FD:C1:B6  -              Samsung       🟢
@@ -59,7 +59,7 @@ IP               MAC                Hostname       Vendor        Status
 
 ```bash
 # Lemotin HP 192.168.1.8 ke 64 Kbps (WA doang, YouTube gak jalan)
-sudo netctl throttle 192.168.1.8 64
+sudo njanet throttle 192.168.1.8 64
 
 # Program bakal jalan terus. Test dari HP target — harusnya loading lama.
 # Kalo mau balikin normal: Ctrl+C
@@ -78,20 +78,20 @@ sudo netctl throttle 192.168.1.8 64
 
 ```bash
 # Blokir total device 192.168.1.8
-sudo netctl block 192.168.1.8
+sudo njanet block 192.168.1.8
 
 # Buka blokir
-sudo netctl unblock 192.168.1.8
+sudo njanet unblock 192.168.1.8
 ```
 
 ### 4. Dashboard — TUI interaktif kaya htop
 
 ```bash
 # Mode liat-liat doang (gak perlu sudo)
-netctl dashboard
+njanet dashboard
 
 # Mode kontrol (block/throttle pake sudo)
-sudo netctl dashboard
+sudo njanet dashboard
 ```
 
 Navigasi di dashboard:
@@ -107,10 +107,10 @@ Navigasi di dashboard:
 ### 5. Lain-lain
 
 ```bash
-netctl list        # Lihat device yang pernah terdeteksi
-netctl stats       # Statistik jaringan
-netctl reset       # Reset semua aturan (block/throttle)
-netctl help        # Bantuan
+njanet list        # Lihat device yang pernah terdeteksi
+njanet stats       # Statistik jaringan
+njanet reset       # Reset semua aturan (block/throttle)
+njanet help        # Bantuan
 ```
 
 ## 📋 Cara Kerja (simple version)
@@ -147,17 +147,17 @@ Waktu di-throttle:
 sudo apt install dsniff -y
 
 # "root required"?
-Jalanin pake sudo: sudo netctl throttle ...
+Jalanin pake sudo: sudo njanet throttle ...
 
 # TC error?
-sudo netctl reset  # Reset dulu
+sudo njanet reset  # Reset dulu
 ```
 
 ## 📁 Project Structure
 
 ```
-netctl/
-├── cmd/netctl/main.go         ← CLI entry point
+njanet/
+├── cmd/njanet/main.go         ← CLI entry point
 ├── internal/
 │   ├── scanner/scanner.go     ← Network scanner (ARP, nmap, ping)
 │   ├── controller/
