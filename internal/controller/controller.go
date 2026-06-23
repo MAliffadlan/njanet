@@ -256,18 +256,14 @@ func (c *Controller) GetTrafficStats() (map[string]int64, error) {
 // --- ARP Spoofing ---
 
 func (c *Controller) startARPSpoof(targetIP string) {
-	fmt.Printf("DEBUG: startARPSpoof(%s) gateway=%q iface=%q\n", targetIP, c.gatewayIP, c.iface)
 	if c.gatewayIP == "" {
-		fmt.Println("DEBUG: gatewayIP empty - SKIP")
 		return
 	}
 
 	os.Setenv("PATH", os.Getenv("PATH")+":/usr/sbin:/sbin")
 	path, err := exec.LookPath("arpspoof")
-	fmt.Printf("DEBUG: arpspoof path=%q err=%v\n", path, err)
 
 	if err != nil {
-		fmt.Println("DEBUG: arpspoof not found, using Python fallback")
 		pySrc := `
 import socket, struct, time
 def arp(iface, sm, si, dm, di):
@@ -299,29 +295,22 @@ def arp(iface, sm, si, dm, di):
 		return
 	}
 
-	fmt.Println("DEBUG: starting arpspoof processes...")
 	c1 := exec.Command(path, "-i", c.iface, "-t", targetIP, c.gatewayIP)
 	err1 := c1.Start()
 	if err1 != nil {
-		fmt.Printf("DEBUG: arpspoof c1 START ERROR: %v\n", err1)
 	} else {
 		c.spoofProcs[targetIP+"_gw"] = c1
-		fmt.Printf("DEBUG: arpspoof c1 started PID=%d\n", c1.Process.Pid)
 	}
 
 	c2 := exec.Command(path, "-i", c.iface, "-t", c.gatewayIP, targetIP)
 	err2 := c2.Start()
 	if err2 != nil {
-		fmt.Printf("DEBUG: arpspoof c2 START ERROR: %v\n", err2)
 	} else {
 		c.spoofProcs[targetIP+"_tgt"] = c2
-		fmt.Printf("DEBUG: arpspoof c2 started PID=%d\n", c2.Process.Pid)
 	}
-	fmt.Println("DEBUG: arpspoof processes started")
 }
 
 func (c *Controller) stopARPSpoof(targetIP string) {
-	fmt.Printf("DEBUG: stopARPSpoof(%s)\n", targetIP)
 	for _, suffix := range []string{"_gw", "_tgt"} {
 		key := targetIP + suffix
 		if cmd, ok := c.spoofProcs[key]; ok {

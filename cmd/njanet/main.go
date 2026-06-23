@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -53,6 +54,8 @@ func main() {
 		cmdUnblock(ifaceName)
 	case "throttle":
 		cmdThrottle(ifaceName)
+	case "hog", "monopoly", "prioritize":
+		cmdHog(ifaceName)
 	case "reset":
 		cmdReset(ifaceName)
 	case "stats":
@@ -78,6 +81,7 @@ Usage:
   njanet unblock <mac/ip>  Unblock device
   njanet throttle <mac/ip> <speed_kbps>  Limit bandwidth
   njanet rename <ip> <name>  Set device nickname
+  njanet hog <speed>       Throttle ALL devices except you
   njanet stats             Show network stats
   njanet reset             Reset all rules
   njanet monitor           Live monitor network
@@ -516,6 +520,70 @@ func cmdDashboard(ifaceName string) {
 		fmt.Fprintf(os.Stderr, "Dashboard error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func cmdHog(ifaceName string) {
+	speed := 64
+	if len(os.Args) >= 3 {
+		s, err := strconv.Atoi(os.Args[2])
+		if err == nil && s > 0 {
+			speed = s
+		}
+	}
+
+	database := initDB()
+	defer database.Close()
+
+	// Scan to get current devices
+	fmt.Println("🔍 Scanning network for devices...")
+	sc := initScanner(ifaceName)
+	ctx := context.Background()
+	result, err := sc.Scan(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Scan error: %v\n", err)
+		os.Exit(1)
+	}
+
+	myIP := getMyIP(ifaceName)
+	fmt.Printf("   Your IP: %s\n", myIP)
+	fmt.Printf("   Devices found: %d\n", len(result.Devices))
+	fmt.Println()
+
+	ctrl := initController(ifaceName)
+
+	count := 0
+	for _, dev := range result.Devices {
+		if dev.IP == myIP {
+			fmt.Printf("   ⏭️  Skip: %s (your device)\n", dev.IP)
+			continue
+		}
+		if dev.MAC == "00:00:00:00:00:00" {
+			continue
+		}
+		fmt.Printf("   🐢 Throttling %s -> %d Kbps\n", dev.IP, speed)
+		ctrl.ThrottleDevice(dev, speed)
+		database.UpdateDeviceSpeed(dev.MAC, speed)
+		count++
+	}
+
+	fmt.Printf("\n✅ %d devices throttled to %d Kbps\n", count, speed)
+	fmt.Println("⏳ Press Ctrl+C to stop hogging and restore all")
+	fmt.Println()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+
+	// Restore all
+	fmt.Println("\n🔄 Restoring all devices...")
+	for _, dev := range result.Devices {
+		if dev.IP == myIP || dev.MAC == "00:00:00:00:00:00" {
+			continue
+		}
+		ctrl.ThrottleDevice(dev, 0)
+		database.UpdateDeviceSpeed(dev.MAC, 0)
+	}
+	fmt.Println("✅ All devices restored")
 }
 
 // --- Helpers ---
