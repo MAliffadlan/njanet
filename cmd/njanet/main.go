@@ -32,7 +32,7 @@ func main() {
 	// Determine network interface
 	ifaceName := os.Getenv("NETCTL_IFACE")
 	if ifaceName == "" {
-		ifaceName = "enp2s0"
+			ifaceName = autoDetectInterface()
 	}
 
 	cmd := os.Args[1]
@@ -116,6 +116,27 @@ func initScanner(ifaceName string) *scanner.Scanner {
 
 func initController(ifaceName string) *controller.Controller {
 	return controller.New(ifaceName, getMyIP(ifaceName), getGatewayIP())
+}
+
+func autoDetectInterface() string {
+	// Try NETCTL_IFACE env first
+	if env := os.Getenv("NETCTL_IFACE"); env != "" {
+		return env
+	}
+	// Auto-detect: find interface with default route + IPv4
+	out, _ := exec.Command("ip", "-4", "route", "show", "default").Output()
+	for _, line := range strings.Split(string(out), "\n") {
+		parts := strings.Fields(line)
+		if len(parts) >= 5 {
+			iface := parts[4]
+			// Verify it has an IP
+			ipOut, _ := exec.Command("ip", "-4", "addr", "show", iface).Output()
+			if strings.Contains(string(ipOut), "inet ") {
+				return iface
+			}
+		}
+	}
+	return "enp2s0"
 }
 
 func getMyIP(ifaceName string) string {
