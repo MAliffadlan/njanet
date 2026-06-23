@@ -45,6 +45,8 @@ func main() {
 		cmdDashboard(ifaceName)
 	case "list", "ls":
 		cmdList(ifaceName)
+	case "rename", "name":
+		cmdRename(ifaceName)
 	case "block":
 		cmdBlock(ifaceName)
 	case "unblock":
@@ -75,6 +77,7 @@ Usage:
   njanet block <mac/ip>    Block device
   njanet unblock <mac/ip>  Unblock device
   njanet throttle <mac/ip> <speed_kbps>  Limit bandwidth
+  njanet rename <ip> <name>  Set device nickname
   njanet stats             Show network stats
   njanet reset             Reset all rules
   njanet monitor           Live monitor network
@@ -176,7 +179,10 @@ func cmdScan(ifaceName string) {
 		if !dev.Online {
 			status = "⚪"
 		}
-		hostname := dev.Hostname
+		hostname := dev.Nickname
+		if hostname == "" {
+			hostname = dev.Hostname
+		}
 		if hostname == "" {
 			hostname = "-"
 		}
@@ -217,9 +223,9 @@ func cmdList(ifaceName string) {
 		} else {
 			status = "⚡ FULL"
 		}
-		hostname := dev.Hostname
+		hostname := dev.Nickname
 		if hostname == "" {
-			hostname = dev.Nickname
+			hostname = dev.Hostname
 		}
 		if hostname == "" {
 			hostname = "-"
@@ -229,6 +235,28 @@ func cmdList(ifaceName string) {
 			truncate(dev.DeviceType, 15), status)
 	}
 	fmt.Printf("\n%d devices total\n", len(devices))
+}
+
+func cmdRename(ifaceName string) {
+	if len(os.Args) < 4 {
+		fmt.Println("Usage: njanet rename <ip> <nickname>")
+		return
+	}
+	target := os.Args[2]
+	name := os.Args[3]
+
+	database := initDB()
+	defer database.Close()
+
+	devices, _ := database.GetAllDevices()
+	for _, d := range devices {
+		if d.IP == target || d.MAC == target {
+			database.UpdateDeviceNickname(d.MAC, name)
+			fmt.Printf("✅ %s (%s) renamed to: %s\n", d.IP, d.MAC, name)
+			return
+		}
+	}
+	fmt.Printf("Device %s not found. Run 'njanet scan' first.\n", target)
 }
 
 func cmdBlock(ifaceName string) {
