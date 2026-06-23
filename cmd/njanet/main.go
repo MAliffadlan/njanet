@@ -677,7 +677,7 @@ func cmdHog(ifaceName string) {
 			fmt.Printf("   ⏭️  Skip: %s (your device)\n", dev.IP)
 			continue
 		}
-		if protected[dev.IP] {
+		if protected[dev.MAC] {
 			fmt.Printf("   Skip: %s (protected)\n", dev.IP)
 			continue
 		}
@@ -704,7 +704,7 @@ func cmdHog(ifaceName string) {
 		if dev.IP == myIP || dev.MAC == "00:00:00:00:00:00" {
 			continue
 		}
-		if protected[dev.IP] {
+		if protected[dev.MAC] {
 			continue
 		}
 		ctrl.ThrottleDevice(dev, 0)
