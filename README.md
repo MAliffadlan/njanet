@@ -1,180 +1,193 @@
-# NjaNet — Network Controller
+# NjaNet
 
-**Kontrol WiFi dari terminal — lihat device, blokir, atau lemotin koneksi mereka.**
+Kontrol perangkat dalam jaringan WiFi dari terminal. Lihat siapa saja yang terhubung, batasi kecepatan, atau blokir koneksi mereka.
 
-Mirip kayak **NetCut**, tapi **gratis, open source, dan buat Linux**.
+Mirip NetCut, gratis dan open source.
+
+## Fitur
+
+- Scan jaringan, deteksi perangkat (IP, MAC, vendor, hostname)
+- Throttle - batasi kecepatan internet perangkat
+- Block - putuskan koneksi perangkat
+- Hog - batasi semua perangkat kecuali laptop sendiri
+- Dashboard TUI interaktif (mirip htop)
+- Rename - beri nama sendiri pada perangkat
+- Auto-detect interface (WiFi / LAN)
+
+## Cara Kerja
 
 ```
-┌─────────────────────────────────────────────┐
-│  🟢 192.168.1.10  Laptop lo         FULL   │
-│  🔴 192.168.1.8   HP temen          BLOCK  │
-│  🐢 192.168.1.5   HP adik           64Kbps │
-│  🟢 192.168.1.1   Router            FULL   │
-└─────────────────────────────────────────────┘
+Normal:
+  HP -> Router -> Internet
+
+Throttle:
+  HP -> Laptop (ARP spoof) -> Router -> Internet
+                |
+          Bandwidth dibatasi (tc)
 ```
 
-## 📦 Install
+NjaNet menggunakan ARP spoof untuk mengarahkan traffic perangkat target melewati laptop, kemudian membatasi bandwidth menggunakan tc (traffic control). Saat program dimatikan (Ctrl+C), jaringan kembali normal.
+
+## Instalasi
 
 ```bash
-# 1. Download / clone
+# Clone repository
 git clone https://github.com/mectov/njanet
 cd njanet
 
-# 2. Build
+# Build
 go build -o njanet cmd/njanet/main.go
 
-# 3. Install ke PATH (biar tinggal ketik "njanet")
+# Install ke sistem
 sudo cp njanet /usr/local/bin/
 
-# 4. Install ARP spoof tool (WAJIB buat block/throttle)
+# Install ARP spoof tool (wajib untuk throttle / block)
 sudo apt install dsniff -y
 ```
 
-## 🚀 Cara Pake
+## Penggunaan
 
-### 1. Scan — Lihat siapa aja yang terhubung ke WiFi
+### Scan
 
 ```bash
 sudo njanet scan
 ```
 
-Contoh hasil:
+Hasil:
 ```
-🔍 Scanning network...
-
-✅ Scan completed in 4.3s
-   Devices found: 8 (8 online)
-
-IP               MAC                Hostname       Vendor        Status
-192.168.1.10     0C:9D:92:3F:07:D6  njanet-host    ASUS          🟢
-192.168.1.1      D0:04:92:18:9F:D8  _gateway       Fiberhome     🟢
-192.168.1.8      72:86:B5:64:81:6F  -              Unknown       🟢
-192.168.1.200    64:1C:AE:FD:C1:B6  -              Samsung       🟢
-...
+IP               MAC                Vendor        Status
+192.168.1.10     0C:9D:92:3F:07:D6  ASUS          Online
+192.168.1.1      D0:04:92:18:9F:D8  Fiberhome     Online
+192.168.1.8      72:86:B5:64:81:6F  -             Online
 ```
 
-> 💡 Catet IP device yang mau diatur (contoh: `192.168.1.8`)
+### Throttle
 
-### 2. Throttle — Bikin koneksi device lemot
+Batasi kecepatan perangkat tertentu.
 
 ```bash
-# Lemotin HP 192.168.1.8 ke 64 Kbps (WA doang, YouTube gak jalan)
 sudo njanet throttle 192.168.1.8 64
-
-# Program bakal jalan terus. Test dari HP target — harusnya loading lama.
-# Kalo mau balikin normal: Ctrl+C
 ```
 
-**Angka speed (Kbps) biar kebayang:**
-| Speed | Kira-kira bisa buat apa |
-|-------|------------------------|
-| `64` | WA doang, YouTube/TikTok gak muter |
-| `128` | WA + browsing teks pelan |
-| `256` | Browsing dikit, streaming gak HD |
-| `512` | Lumayan normal |
-| `1024` | Hampir gak kerasa bedanya |
+Angka speed dalam Kbps:
+- `64` - WA bisa, video tidak
+- `128` - WA + browsing teks pelan
+- `256` - browsing, streaming tidak HD
+- `512` - hampir normal
+- `1024` - nyaris tidak terasa
 
-### 3. Block — Putusin koneksi total
+Program berjalan terus sampai di Ctrl+C. Saat dimatikan, kecepatan kembali normal.
+
+### Block
+
+Putuskan koneksi perangkat secara total.
 
 ```bash
-# Blokir total device 192.168.1.8
 sudo njanet block 192.168.1.8
-
-# Buka blokir
 sudo njanet unblock 192.168.1.8
 ```
 
-### 4. Dashboard — TUI interaktif kaya htop
+### Hog
+
+Batasi semua perangkat dalam jaringan, kecuali laptop sendiri.
 
 ```bash
-# Mode liat-liat doang (gak perlu sudo)
+sudo njanet hog 64
+```
+
+Cocok digunakan saat ingin memonopoli bandwidth, misalnya saat download file besar atau streaming.
+
+### Dashboard
+
+Tampilan interaktif di terminal (mirip htop).
+
+```bash
+# Mode lihat (tanpa sudo)
 njanet dashboard
 
-# Mode kontrol (block/throttle pake sudo)
+# Mode kontrol (dengan sudo)
 sudo njanet dashboard
 ```
 
-Navigasi di dashboard:
+Navigasi:
 | Tombol | Fungsi |
 |--------|--------|
-| `↑/↓` | Pilih device |
-| `Enter` | Detail device |
-| `b` | Block/unblock |
-| `1-9` | Speed limit (1=1024Kbps, 9=9Mbps) |
-| `r` | Scan ulang |
-| `ESC/q` | Keluar |
+| Arrow Up/Down | Pilih perangkat |
+| Enter | Detail perangkat |
+| b | Block / unblock |
+| 1-9 | Atur speed limit |
+| r | Scan ulang |
+| ESC / q | Keluar |
 
-### 5. Lain-lain
+### Perintah Lain
 
 ```bash
-njanet list        # Lihat device yang pernah terdeteksi
-njanet stats       # Statistik jaringan
-njanet reset       # Reset semua aturan (block/throttle)
-njanet help        # Bantuan
+njanet list               # Lihat daftar perangkat
+njanet rename 192.168.1.8 "HP Budi"  # Beri nama
+njanet stats              # Statistik jaringan
+njanet reset              # Reset semua aturan
+njanet help               # Bantuan
 ```
 
-## 📋 Cara Kerja (simple version)
+### Rename
 
-```
-Normal:
-  📱 HP → 🖥️ ROUTER → 🌐 Internet
+Memberi nama pada perangkat agar mudah dikenali.
 
-Waktu di-throttle:
-  📱 HP → 💻 LAPTOP (ARP spoof) → 🖥️ ROUTER → 🌐 Internet
-               ↓
-          Traffic dibatesin pake tc (traffic control)
+```bash
+njanet rename 192.168.1.8 "HP Budi"
+njanet rename 192.168.1.1 "Router"
+njanet list
 ```
 
-1. **ARP Spoof** — Laptop lo "berpura-pura" jadi router. Device target kira laptop lo adalah gateway.
-2. **IP Forwarding** — Traffic diterusin ke router beneran.
-3. **tc (Traffic Control)** — Bandwidth dibatesin sesuai perintah.
-4. **Kalo program dimatiin** (Ctrl+C) — Semua balik normal.
+Nama hanya disimpan di database lokal dan tidak mempengaruhi perangkat asli.
 
-## ⚠️ Keterbatasan
+## Keterbatasan
 
-| Situasi | Bisa? |
-|---------|-------|
-| HP Android, laptop Windows/Linux | ✅ Work |
-| iPhone (beberapa versi iOS) | ⚠️ Tergantung proteksi ARP |
-| Device pake VPN | ❌ Gak work |
-| Laptop lo mati/suspend | ❌ Throttle ikut mati |
-| Target restart | ⚠️ Koneksi balik bentar |
+| Situasi | Keterangan |
+|---------|------------|
+| HP Android, laptop Windows/Linux | Berfungsi |
+| iPhone (beberapa versi iOS) | Tergantung proteksi ARP |
+| Perangkat menggunakan VPN | Tidak berfungsi |
+| Laptop mati / suspend | Throttle ikut mati |
+| Perangkat restart | Koneksi kembali normal |
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
-```
-# ARP spoof gak jalan?
+```bash
+# ARP spoof tidak berjalan
 sudo apt install dsniff -y
 
-# "root required"?
-Jalanin pake sudo: sudo njanet throttle ...
+# Error "root required"
+Gunakan sudo: sudo njanet throttle ...
 
-# TC error?
-sudo njanet reset  # Reset dulu
+# Error tc, reset aturan
+sudo njanet reset
 ```
 
-## 📁 Project Structure
+## Instalasi dari Source
+
+```bash
+git clone https://github.com/mectov/njanet
+cd njanet
+go build -o njanet cmd/njanet/main.go
+sudo cp njanet /usr/local/bin/
+```
+
+## Struktur Project
 
 ```
 njanet/
-├── cmd/njanet/main.go         ← CLI entry point
+├── cmd/njanet/main.go         # Entry point CLI
 ├── internal/
-│   ├── scanner/scanner.go     ← Network scanner (ARP, nmap, ping)
-│   ├── controller/
-│   │   ├── controller.go      ← Block, throttle, ARP spoof
-│   ├── db/
-│   │   ├── models.go          ← Data structures
-│   │   └── database.go        ← SQLite storage
-│   ├── api/handlers.go        ← REST API
-│   └── ui/tui/dashboard.go    ← Terminal UI (htop-like)
+│   ├── scanner/               # Scanner jaringan (ARP, nmap, ping)
+│   ├── controller/            # Block, throttle, ARP spoof
+│   ├── db/                    # SQLite database
+│   ├── api/                   # REST API
+│   └── ui/tui/                # Terminal UI
 ├── go.mod
 └── README.md
 ```
 
-## 📜 License
+## Lisensi
 
-MIT — bebas dipake, dimodifikasi, disebarluaskan.
-
----
-
-*Dibuat karena males beli NetCut tapi butuh juga fiturnya.*
+MIT
