@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
@@ -435,33 +437,55 @@ func (s *Scanner) LoadOUI() error {
 		"00:15:99": "Brother",
 
 		// Random/PC vendors
-		"00:80:48": "Xerox",
-		"00:1D:60": "Foxconn",
-		"38:D5:47": "Lenovo",
-		"00:1B:24": "Lenovo",
-		"00:21:CC": "Lenovo",
-		"B8:88:E3": "Lenovo",
-		"E4:1F:13": "Lenovo",
-		"FC:AA:14": "Lenovo",
-		"00:09:0D": "Acer",
-		"00:1C:25": "Acer",
-		"00:23:5A": "Acer",
-		"F8:2F:A8": "Acer",
-		"2C:FD:A1": "Acer",
-		"00:1E:58": "Toshiba",
-		"00:24:4B": "Toshiba",
-		"00:17:08": "Panasonic",
-		"00:1C:CE": "Panasonic",
-		"00:24:44": "Panasonic",
-		"00:1D:7D": "Sharp",
-		"00:03:77": "Palm",
-		"00:0D:4E": "Palm",
 
-		// Automotive
-		"00:01:5E": "Tesla",
-		"98:F0:AB": "Tesla",
-		"00:04:3E": "Ford",
-		"00:1B:EB": "BMW",
+	// More Campus / Indonesian common vendors
+	"CC:2D:21": "Tenda",
+	"D0:C5:D3": "AzureWave",
+	"C4:FE:5B": "OPPO",
+	"30:F6:EF": "Tenda",
+	"8C:A9:82": "Xiaomi",
+	"C8:5B:76": "Huawei",
+	"F4:1E:57": "TP-Link",
+	"EC:2E:4E": "Huawei",
+	"5C:02:14": "Vivo",
+	"A8:72:2D": "OnePlus",
+	"90:4A:1C": "Nokia",
+	"28:E3:47": "Samsung",
+	"DC:2C:6E": "Cisco Meraki",
+	"20:2B:20": "Samsung",
+	"74:AC:B9": "Huawei",
+	"14:14:16": "Xiaomi",
+	"F8:D1:11": "Huawei",
+	"18:02:AE": "Xiaomi",
+	"50:C2:E8": "Intel",
+	"34:02:86": "Samsung",
+	"CC:B8:5E": "Intel",
+	"00:80:48": "Xerox",
+	"00:1D:60": "Foxconn",
+	"38:D5:47": "Lenovo",
+	"00:1B:24": "Lenovo",
+	"00:21:CC": "Lenovo",
+	"B8:88:E3": "Lenovo",
+	"E4:1F:13": "Lenovo",
+	"FC:AA:14": "Lenovo",
+	"00:09:0D": "Acer",
+	"00:1C:25": "Acer",
+	"00:23:5A": "Acer",
+	"F8:2F:A8": "Acer",
+	"2C:FD:A1": "Acer",
+	"00:1E:58": "Toshiba",
+	"00:24:4B": "Toshiba",
+	"00:17:08": "Panasonic",
+	"00:1C:CE": "Panasonic",
+	"00:24:44": "Panasonic",
+	"00:1D:7D": "Sharp",
+	"00:03:77": "Palm",
+	"00:0D:4E": "Palm",
+	// Automotive
+	"00:01:5E": "Tesla",
+	"98:F0:AB": "Tesla",
+	"00:04:3E": "Ford",
+	"00:1B:EB": "BMW",
 	}
 
 	for k, v := range builtin {
@@ -487,7 +511,41 @@ func (s *Scanner) LookupVendor(mac string) string {
 		return vendor
 	}
 
+	// Try online API fallback (cached)
+	vendor = s.lookupOnline(oui)
+	if vendor != "" {
+		s.mu.Lock()
+		s.ouiDB[oui] = vendor
+		s.mu.Unlock()
+		return vendor
+	}
+
 	return "Unknown"
+}
+
+// lookupOnline queries macvendors.com for unknown MAC OUIs
+func (s *Scanner) lookupOnline(oui string) string {
+	url := "https://api.macvendors.com/" + oui[:2] + ":" + oui[2:4] + ":" + oui[4:6]
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "NjaNet/1.0")
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return ""
+	}
+	body, _ := io.ReadAll(resp.Body)
+	result := strings.TrimSpace(string(body))
+	if len(result) > 0 && len(result) < 100 {
+		return result
+	}
+	return ""
 }
 
 // PingScan sends ICMP echo requests to all hosts in subnet
@@ -538,16 +596,22 @@ func (s *Scanner) ARPScan(ctx context.Context) ([]*db.Device, error) {
 		}
 	}
 
-	// Fall back to nmap ARP scan
+		// Fall back to nmap ARP scan
 	if nmapPath, err := exec.LookPath("nmap"); err == nil {
 		devices, _ = s.nmapARPScan(ctx, nmapPath)
-		if len(devices) > 0 {
+		if len(devices) > 1 {
 			return devices, nil
 		}
 	}
 
-	// Final fallback: raw ARP + ping scan
-	return s.rawARPScan(ctx)
+	s.pingSweep()
+
+	devices, _ = s.rawARPScan(ctx)
+	if len(devices) > 1 {
+		return devices, nil
+	}
+
+	return s.readARPTable(), nil
 }
 
 func (s *Scanner) arpScanWithTool(ctx context.Context, arpScanPath string) ([]*db.Device, error) {
@@ -659,6 +723,34 @@ func (s *Scanner) nmapARPScan(ctx context.Context, nmapPath string) ([]*db.Devic
 	}
 
 	return devices, nil
+}
+
+// pingSweep pings subnet to populate ARP cache (fast)
+func (s *Scanner) pingSweep() {
+	ones, bits := s.subnet.Mask.Size()
+	n := 1 << uint(bits-ones)
+	if n > 512 {
+		n = 512
+	}
+	ip := make(net.IP, len(s.myIP))
+	copy(ip, s.myIP)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 50)
+	for i := 1; i < n; i++ {
+		ip[3] = byte(i)
+		if ip.Equal(s.myIP) {
+			continue
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			exec.Command("timeout", "0.3", "ping", "-c", "1", "-q", addr).Run()
+		}(ip.String())
+	}
+	// Wait for all to complete (with ~5s max for /24)
+	wg.Wait()
 }
 
 func (s *Scanner) rawARPScan(ctx context.Context) ([]*db.Device, error) {
