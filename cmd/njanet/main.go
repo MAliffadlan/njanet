@@ -16,7 +16,6 @@ import (
 	"github.com/mectov/njanet/internal/controller"
 	"github.com/mectov/njanet/internal/db"
 	"github.com/mectov/njanet/internal/scanner"
-	"github.com/mectov/njanet/internal/ui/tui"
 )
 
 const (
@@ -42,8 +41,6 @@ func main() {
 		cmdScan(ifaceName)
 	case "web":
 		cmdWeb(ifaceName)
-	case "dashboard", "dash", "tui", "top":
-		cmdDashboard(ifaceName)
 	case "list", "ls":
 		cmdList(ifaceName)
 	case "protect":
@@ -77,8 +74,6 @@ func printUsage() {
 Usage:
   njanet scan              Scan network for devices
   njanet list              List known devices
-  njanet dashboard         Interactive TUI dashboard (like htop)
-  njanet web               Start web dashboard
   njanet block <mac/ip>    Block device
   njanet unblock <mac/ip>  Unblock device
   njanet throttle <mac/ip> <speed_kbps>  Limit bandwidth
@@ -94,7 +89,6 @@ Environment:
 
 Examples:
   njanet scan
-  njanet dashboard
   njanet block 192.168.1.100
   njanet throttle 192.168.1.100 1024
 `)
@@ -529,38 +523,54 @@ func cmdStats(ifaceName string) {
 }
 
 func cmdMonitor(ifaceName string) {
-	fmt.Println("📡 Monitoring network (Ctrl+C to stop)...")
-	fmt.Println()
-
-	// Simple monitor: scan every 30 seconds
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
+	sc := initScanner(ifaceName)
+	ctx := context.Background()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// Initial scan
-	sc := initScanner(ifaceName)
-	ctx := context.Background()
-
-	doScan := func() {
-		result, err := sc.Scan(ctx)
-		if err != nil {
-			fmt.Printf("Scan error: %v\n", err)
-			return
-		}
-		fmt.Printf("\r[%s] %d devices online    ", time.Now().Format("15:04:05"), result.Online)
-	}
-
-	doScan()
+	fmt.Println("📡 Network Monitor (Ctrl+C to stop)")
+	fmt.Println()
 
 	for {
 		select {
-		case <-ticker.C:
-			doScan()
 		case <-sigCh:
-			fmt.Println("\n\nMonitor stopped.")
+			fmt.Println("\nMonitor stopped.")
 			return
+		default:
+			result, err := sc.Scan(ctx)
+			if err == nil {
+				// Save to DB
+				database := initDB()
+				for _, dev := range result.Devices {
+					database.UpsertDevice(dev)
+				}
+				database.Close()
+
+				// Clear screen and print
+				fmt.Print("\033[H\033[2J")
+				fmt.Printf("📡 %s — %d devices (%d online)\n",
+					time.Now().Format("15:04:05"), result.Total, result.Online)
+				fmt.Println(strings.Repeat("─", 70))
+				fmt.Printf("%-18s %-20s %-12s %s\n", "IP", "Hostname", "Vendor", "Status")
+				fmt.Println(strings.Repeat("─", 70))
+
+				for _, dev := range result.Devices {
+					hostname := dev.Nickname
+					if hostname == "" {
+						hostname = dev.Hostname
+					}
+					if hostname == "" {
+						hostname = "-"
+					}
+					status := "up"
+					if !dev.Online {
+						status = "off"
+					}
+					fmt.Printf("%-18s %-20s %-12s %s\n",
+						dev.IP, truncate(hostname, 18), truncate(dev.Vendor, 10), status)
+				}
+			}
+			time.Sleep(5 * time.Second)
 		}
 	}
 }
@@ -599,38 +609,6 @@ func cmdWeb(ifaceName string) {
 	}
 }
 
-func cmdDashboard(ifaceName string) {
-	database := initDB()
-	sc := initScanner(ifaceName)
-	ctrl := initController(ifaceName)
-	defer database.Close()
-
-	fmt.Print("\033[2J\033[H")
-	fmt.Println("📡  NjaNet Dashboard — starting...")
-	fmt.Println("   Scanning network for devices...")
-	fmt.Println()
-
-	ctx := context.Background()
-	result, err := sc.Scan(ctx)
-	if err == nil {
-		for _, dev := range result.Devices {
-			database.UpsertDevice(dev)
-		}
-		database.LogScan(result.Total, result.Online)
-	}
-
-	if !ctrl.IsReady() {
-		fmt.Println("   ⚠️  Run with 'sudo njanet dashboard' to enable block/throttle features")
-		fmt.Println("   📡 View-only mode — scan & monitor still work\n")
-		time.Sleep(2 * time.Second)
-	}
-
-	dash := tui.New(sc, ctrl, database)
-	if err := dash.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Dashboard error: %v\n", err)
-		os.Exit(1)
-	}
-}
 
 func cmdHog(ifaceName string) {
 	speed := 64
