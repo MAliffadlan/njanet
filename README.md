@@ -1,7 +1,7 @@
 <div align="center">
   <img src="Pictures/njanet.png" alt="NjaNet logo" />
 
-  **NjaNet for Network Control**
+  **NjaNet Mectov for Network Control**
 
 </div>
 
