@@ -14,7 +14,15 @@
 
 **NjaNet** adalah tool CLI berbasis Go untuk kontrol jaringan WiFi — scan perangkat, batasi kecepatan, blokir koneksi, dan lindungi jaringan dari ARP spoofing. Dibangun tanpa dependency Python, satu binary siap pakai.
 
-## **2. Fitur**
+## **2. Persiapan**
+
+Diperlukan:
+- Sistem operasi **Linux**
+- **Go 1.22+** (untuk build dari source)
+- Tool **dsniff** (`sudo apt install dsniff`) — untuk ARP spoof
+- Hak akses **root** (sudo) — untuk throttle, block, hog
+
+## **3. Fitur**
 
 - Scan & deteksi perangkat (IP, MAC, vendor, hostname)
 - Throttle — batasi kecepatan internet per perangkat
@@ -27,14 +35,6 @@
 - Rename — beri nama sendiri pada perangkat
 - Auto-detect interface (WiFi / LAN)
 - Vendor lookup online (macvendors.com)
-
-## **3. Persiapan**
-
-Diperlukan:
-- Sistem operasi **Linux**
-- **Go 1.22+** (untuk build dari source)
-- Tool **dsniff** (`sudo apt install dsniff`) — untuk ARP spoof
-- Hak akses **root** (sudo) — untuk throttle, block, hog
 
 ## **4. Instalasi**
 
