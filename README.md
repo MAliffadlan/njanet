@@ -12,8 +12,10 @@ Mirip NetCut, gratis dan open source.
 - Throttle - batasi kecepatan internet perangkat
 - Block - putuskan koneksi perangkat
 - Hog - batasi semua perangkat kecuali laptop sendiri
-- Dashboard TUI interaktif (mirip htop)
+- Protect - lindungi device dari hog (by MAC)
+- Monitor - live scan tiap 5 detik
 - Rename - beri nama sendiri pada perangkat
+- Vendor lookup online (macvendors.com)
 - Auto-detect interface (WiFi / LAN)
 
 ## Cara Kerja
@@ -99,27 +101,24 @@ sudo njanet hog 64
 
 Cocok digunakan saat ingin memonopoli bandwidth, misalnya saat download file besar atau streaming.
 
-### Dashboard
+### Monitor
 
-Tampilan interaktif di terminal (mirip htop).
+Live scan tiap 5 detik, cocok untuk memantau device secara real-time.
 
 ```bash
-# Mode lihat (tanpa sudo)
-njanet dashboard
-
-# Mode kontrol (dengan sudo)
-sudo njanet dashboard
+njanet monitor
 ```
 
-Navigasi:
-| Tombol | Fungsi |
-|--------|--------|
-| Arrow Up/Down | Pilih perangkat |
-| Enter | Detail perangkat |
-| b | Block / unblock |
-| 1-9 | Atur speed limit |
-| r | Scan ulang |
-| ESC / q | Keluar |
+### Protect
+
+Lindungi device dari hog mode berdasarkan MAC (aman antar jaringan).
+
+```bash
+njanet protect add 192.168.1.9 "Server"
+njanet protect add 192.168.1.1 "Router"
+njanet protect list
+njanet protect remove 192.168.1.9
+```
 
 ### Perintah Lain
 
@@ -184,8 +183,7 @@ njanet/
 │   ├── scanner/               # Scanner jaringan (ARP, nmap, ping)
 │   ├── controller/            # Block, throttle, ARP spoof
 │   ├── db/                    # SQLite database
-│   ├── api/                   # REST API
-│   └── ui/tui/                # Terminal UI
+│   └── api/                   # REST API
 ├── go.mod
 └── README.md
 ```
