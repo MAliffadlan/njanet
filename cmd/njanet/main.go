@@ -59,6 +59,8 @@ func main() {
 		cmdReset(ifaceName)
 	case "stats":
 		cmdStats(ifaceName)
+	case "defend":
+		cmdDefend(ifaceName)
 	case "monitor":
 		cmdMonitor(ifaceName)
 	case "help", "-h", "--help":
@@ -80,6 +82,7 @@ Usage:
   njanet protect           Manage protected IPs (excluded from hog)
   njanet hog <speed>       Throttle ALL devices except you
   njanet stats             Show network stats
+  njanet defend            ARP spoof defense monitor
   njanet reset             Reset all rules
   njanet monitor           Live monitor network
 
@@ -565,6 +568,59 @@ func cmdStats(ifaceName string) {
 	fmt.Printf("Blocked devices: %d\n", blocked)
 	fmt.Printf("Traffic in:      %s\n", formatBytes(totalIn))
 	fmt.Printf("Traffic out:     %s\n", formatBytes(totalOut))
+}
+
+func cmdDefend(ifaceName string) {
+	gatewayIP := getGatewayIP()
+	gatewayMAC := resolveGatewayMAC()
+
+	if gatewayMAC == "" {
+		fmt.Println("❌ Cannot determine gateway MAC. Run 'njanet scan' first.")
+		return
+	}
+
+	fmt.Printf("🛡️  NjaNet ARP Defense\n")
+	fmt.Printf("   Gateway:  %s → %s (trusted)\n", gatewayIP, gatewayMAC)
+	fmt.Println()
+
+	defender := scanner.NewARPDefender(ifaceName, gatewayIP, gatewayMAC, getMyIP(ifaceName), getLocalMAC(ifaceName))
+	defender.SetAlertFunc(func(alert scanner.ARPSpoofAlert) {
+		fmt.Println()
+		fmt.Println("══════════════════════════════════════════")
+		fmt.Println("⚠️  ARP SPOOFING ATTACK DETECTED!")
+		fmt.Println("══════════════════════════════════════════")
+		if alert.SpooferIP != "" && alert.SpooferIP != "multiple" {
+			fmt.Printf("👤 Attacker:    %s (MAC: %s)\n", alert.SpooferIP, alert.FakeMAC)
+			fmt.Printf("   💡 Run: sudo njanet block %s\n", alert.SpooferIP)
+			fmt.Printf("   💡 Or:   sudo njanet throttle %s 64\n", alert.SpooferIP)
+		}
+		fmt.Println("══════════════════════════════════════════")
+	})
+
+	defender.Start(true)
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+
+	defender.Stop()
+}
+
+func getLocalMAC(ifaceName string) string {
+	out, _ := exec.Command("cat", "/sys/class/net/"+ifaceName+"/address").Output()
+	return strings.TrimSpace(string(out))
+}
+
+func resolveGatewayMAC() string {
+	data, _ := exec.Command("cat", "/proc/net/arp").Output()
+	gatewayIP := getGatewayIP()
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 4 && fields[0] == gatewayIP && fields[3] != "(incomplete)" {
+			return strings.ToUpper(fields[3])
+		}
+	}
+	return ""
 }
 
 func cmdMonitor(ifaceName string) {
