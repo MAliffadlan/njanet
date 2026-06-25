@@ -109,6 +109,16 @@ func (d *Database) migrate() error {
 		label TEXT DEFAULT '',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
+		CREATE TABLE IF NOT EXISTS watchlist (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		mac TEXT NOT NULL,
+		ip TEXT NOT NULL,
+		rule_type TEXT NOT NULL DEFAULT 'throttle',
+		speed_kbps INTEGER DEFAULT 0,
+		blocked BOOLEAN DEFAULT 0,
+		active BOOLEAN DEFAULT 1
+	);
+
 	`
 	_, err := d.Exec(schema)
 	return err
@@ -358,6 +368,57 @@ func (d *Database) IsProtectedMAC(mac string) (bool, error) {
 	var count int
 	err := d.QueryRow("SELECT COUNT(*) FROM protected_ips WHERE ip = ?", mac).Scan(&count)
 	return count > 0, err
+}
+
+// --- Watchlist ---
+
+type WatchEntry struct {
+	ID        int64
+	MAC       string
+	IP        string
+	RuleType  string
+	SpeedKbps int
+	Blocked   bool
+	Active    bool
+}
+
+func (d *Database) AddWatch(mac, ip, ruleType string, speedKbps int, blocked bool) error {
+	_, err := d.Exec("INSERT OR REPLACE INTO watchlist (mac, ip, rule_type, speed_kbps, blocked) VALUES (?, ?, ?, ?, ?)",
+		mac, ip, ruleType, speedKbps, blocked)
+	return err
+}
+
+func (d *Database) RemoveWatch(mac string) error {
+	_, err := d.Exec("DELETE FROM watchlist WHERE mac = ?", mac)
+	return err
+}
+
+func (d *Database) GetWatchlist() ([]*WatchEntry, error) {
+	rows, err := d.Query("SELECT id, mac, ip, rule_type, speed_kbps, blocked, active FROM watchlist WHERE active = 1")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []*WatchEntry
+	for rows.Next() {
+		e := &WatchEntry{}
+		if err := rows.Scan(&e.ID, &e.MAC, &e.IP, &e.RuleType, &e.SpeedKbps, &e.Blocked, &e.Active); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+func (d *Database) UpdateWatchIP(mac, newIP string) error {
+	_, err := d.Exec("UPDATE watchlist SET ip = ? WHERE mac = ?", newIP, mac)
+	return err
+}
+
+func (d *Database) DeactivateWatch(mac string) error {
+	_, err := d.Exec("UPDATE watchlist SET active = 0 WHERE mac = ?", mac)
+	return err
 }
 
 // --- Scan History ---

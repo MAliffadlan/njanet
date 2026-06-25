@@ -36,6 +36,9 @@ const (
 )
 
 func New(iface, myIP, gatewayIP string) *Controller {
+	// Clean up leftover arpspoof processes from crashed sessions
+	exec.Command("pkill", "-f", "arpspoof.*"+iface).Run()
+
 	c := &Controller{
 		iface:         iface,
 		myIP:          myIP,

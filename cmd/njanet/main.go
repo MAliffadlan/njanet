@@ -76,8 +76,7 @@ Usage:
   njanet list              List known devices
   njanet block <mac/ip>    Block device
   njanet unblock <mac/ip>  Unblock device
-  njanet throttle <mac/ip> <speed_kbps>  Limit bandwidth
-  njanet rename <ip> <name>  Set device nickname
+  njanet throttle <mac/ip> <speed> [--watch]  Limit bandwidth
   njanet protect           Manage protected IPs (excluded from hog)
   njanet hog <speed>       Throttle ALL devices except you
   njanet stats             Show network stats
@@ -457,32 +456,78 @@ func cmdThrottle(ifaceName string) {
 	if dev == nil {
 		dev = &db.Device{MAC: "00:00:00:00:00:00", IP: target}
 	}
+	// Check for --watch flag
+	watchMode := false
+	for _, a := range os.Args {
+		if a == "--watch" || a == "-w" {
+			watchMode = true
+		}
+	}
+
 	if speed == 0 {
 		ctrl.ThrottleDevice(dev, 0)
 		database.UpdateDeviceSpeed(dev.MAC, 0)
 		fmt.Printf("⚡ Unlimited: %s\n", target)
 		return
-		}
+	}
 
-		if err := ctrl.ThrottleDevice(dev, speed); err != nil {
+	if err := ctrl.ThrottleDevice(dev, speed); err != nil {
 		fmt.Fprintf(os.Stderr, "Throttle failed: %v\n", err)
 		os.Exit(1)
-		}
-		database.UpdateDeviceSpeed(dev.MAC, speed)
-
-		fmt.Printf("🐢 Throttled: %s -> %d Kbps\n", target, speed)
-		fmt.Println("⏳ Press Ctrl+C to stop throttling")
-		fmt.Println()
-
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
-
-		fmt.Println("\n🔄 Restoring network...")
-		ctrl.ThrottleDevice(dev, 0)
-		database.UpdateDeviceSpeed(dev.MAC, 0)
-		fmt.Println("✅ Network restored")
 	}
+	database.UpdateDeviceSpeed(dev.MAC, speed)
+
+	if watchMode && dev.MAC != "00:00:00:00:00:00" {
+		database.AddWatch(dev.MAC, dev.IP, "throttle", speed, false)
+		fmt.Printf("🔍 Watch active for %s (MAC: %s)\n", target, dev.MAC)
+		fmt.Println("   Auto-track IP changes every 10s")
+	}
+
+	fmt.Printf("🐢 Throttled: %s -> %d Kbps\n", target, speed)
+	fmt.Println("⏳ Press Ctrl+C to stop")
+	fmt.Println()
+
+	// Start watch loop if enabled
+	if watchMode && dev.MAC != "00:00:00:00:00:00" {
+		sc := initScanner(ifaceName)
+		go func() {
+			for {
+				entries, _ := database.GetWatchlist()
+				for _, e := range entries {
+					if !e.Active || e.MAC == "" {
+						continue
+					}
+					ctx := context.Background()
+					result, err := sc.Scan(ctx)
+					if err != nil {
+						continue
+					}
+					for _, d := range result.Devices {
+						if d.MAC == e.MAC && d.IP != e.IP {
+							fmt.Printf("\n🔍 %s changed IP: %s -> %s\n", e.MAC, e.IP, d.IP)
+							ctrl.ThrottleDevice(d, e.SpeedKbps)
+							database.UpdateWatchIP(e.MAC, d.IP)
+							fmt.Printf("   Re-applied throttle to %s\n", d.IP)
+						}
+					}
+				}
+				time.Sleep(10 * time.Second)
+			}
+		}()
+	}
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+
+	fmt.Println("\n🔄 Restoring network...")
+	ctrl.ThrottleDevice(dev, 0)
+	database.UpdateDeviceSpeed(dev.MAC, 0)
+	if dev.MAC != "00:00:00:00:00:00" {
+		database.DeactivateWatch(dev.MAC)
+	}
+	fmt.Println("✅ Network restored")
+}
 
 func cmdReset(ifaceName string) {
 	ctrl := initController(ifaceName)

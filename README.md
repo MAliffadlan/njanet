@@ -12,6 +12,7 @@ Mirip NetCut, gratis dan open source.
 - Throttle - batasi kecepatan internet perangkat
 - Block - putuskan koneksi perangkat
 - Hog - batasi semua perangkat kecuali laptop sendiri
+- Watch - auto-track device saat ganti IP (--watch)
 - Protect - lindungi device dari hog (by MAC)
 - Monitor - live scan tiap 5 detik
 - Rename - beri nama sendiri pada perangkat
@@ -71,6 +72,9 @@ Batasi kecepatan perangkat tertentu.
 
 ```bash
 sudo njanet throttle 192.168.1.8 64
+
+# Auto-track device saat ganti IP (--watch)
+sudo njanet throttle 192.168.1.8 64 --watch
 ```
 
 Angka speed dalam Kbps:
