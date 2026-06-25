@@ -1235,10 +1235,39 @@ func (s *Scanner) Scan(ctx context.Context) (*ScanResult, error) {
 	extraDevices := s.readARPTable()
 	for _, dev := range extraDevices {
 		if !knownMACs[dev.MAC] && !isMulticastMAC(dev.MAC) {
-			dev.Online = true
 			s.EnrichDevice(ctx, dev)
 			allDevices = append(allDevices, dev)
 			knownMACs[dev.MAC] = true
+			onlineCount++
+		}
+	}
+
+	// 5. Verify online status with concurrent ping
+	var pingWg sync.WaitGroup
+	pingSem := make(chan struct{}, 20)
+	for _, dev := range allDevices {
+		if dev.MAC == myDev.MAC {
+			continue
+		}
+		pingWg.Add(1)
+		pingSem <- struct{}{}
+		go func(d *db.Device) {
+			defer pingWg.Done()
+			defer func() { <-pingSem }()
+			ip := net.ParseIP(d.IP)
+			if ip == nil {
+				return
+			}
+			alive := s.icmpPing(ip, 300*time.Millisecond) ||
+				s.tcpPing(ip, 80, 200*time.Millisecond) ||
+				s.tcpPing(ip, 443, 200*time.Millisecond)
+			d.Online = alive
+		}(dev)
+	}
+	pingWg.Wait()
+	onlineCount = 0
+	for _, d := range allDevices {
+		if d.Online {
 			onlineCount++
 		}
 	}

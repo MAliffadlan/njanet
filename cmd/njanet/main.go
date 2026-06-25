@@ -656,53 +656,71 @@ func resolveGatewayMAC() string {
 
 func cmdMonitor(ifaceName string) {
 	sc := initScanner(ifaceName)
-	ctx := context.Background()
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		<-sigCh
+		cancel()
+	}()
 
 	fmt.Println("📡 Network Monitor (Ctrl+C to stop)")
 	fmt.Println()
 
 	for {
-		select {
-		case <-sigCh:
+		if ctx.Err() != nil {
 			fmt.Println("\nMonitor stopped.")
 			return
-		default:
-			result, err := sc.Scan(ctx)
-			if err == nil {
-				// Save to DB
-				database := initDB()
-				for _, dev := range result.Devices {
-					database.UpsertDevice(dev)
-				}
-				database.Close()
+		}
 
-				// Clear screen and print
-				fmt.Print("\033[H\033[2J")
-				fmt.Printf("📡 %s — %d devices (%d online)\n",
-					time.Now().Format("15:04:05"), result.Total, result.Online)
-				fmt.Println(strings.Repeat("─", 70))
-				fmt.Printf("%-18s %-20s %-12s %s\n", "IP", "Hostname", "Vendor", "Status")
-				fmt.Println(strings.Repeat("─", 70))
-
-				for _, dev := range result.Devices {
-					hostname := dev.Nickname
-					if hostname == "" {
-						hostname = dev.Hostname
-					}
-					if hostname == "" {
-						hostname = "-"
-					}
-					status := "up"
-					if !dev.Online {
-						status = "off"
-					}
-					fmt.Printf("%-18s %-20s %-12s %s\n",
-						dev.IP, truncate(hostname, 18), truncate(dev.Vendor, 10), status)
-				}
+		result, err := sc.Scan(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				fmt.Println("\nMonitor stopped.")
+				return
 			}
-			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Save to DB
+		database := initDB()
+		for _, dev := range result.Devices {
+			database.UpsertDevice(dev)
+		}
+		database.Close()
+
+		// Print header
+		fmt.Printf("\n📡 %s — %d devices (%d online)\n",
+			time.Now().Format("15:04:05"), result.Total, result.Online)
+		fmt.Println(strings.Repeat("─", 70))
+		fmt.Printf("%-18s %-20s %-12s %s\n", "IP", "Hostname", "Vendor", "Status")
+		fmt.Println(strings.Repeat("─", 70))
+
+		for _, dev := range result.Devices {
+			hostname := dev.Nickname
+			if hostname == "" {
+				hostname = dev.Hostname
+			}
+			if hostname == "" {
+				hostname = "-"
+			}
+			status := "up"
+			if !dev.Online {
+				status = "off"
+			}
+			fmt.Printf("%-18s %-20s %-12s %s\n",
+				dev.IP, truncate(hostname, 18), truncate(dev.Vendor, 10), status)
+		}
+
+		select {
+		case <-ctx.Done():
+			fmt.Println("\nMonitor stopped.")
+			return
+		case <-time.After(5 * time.Second):
 		}
 	}
 }
