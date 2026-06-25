@@ -23,7 +23,7 @@ import (
 
 const (
 	vendorDBURL = "https://raw.githubusercontent.com/wireshark/wireshark/master/manuf"
-	ouiDBPath   = "/tmp/netctl_oui.db"
+	ouiDBPath   = "/tmp/njanet_oui.db"
 )
 
 type Scanner struct {
@@ -789,7 +789,7 @@ func (s *Scanner) rawARPScan(ctx context.Context) ([]*db.Device, error) {
 
 func (s *Scanner) readARPTable() []*db.Device {
 	// Read /proc/net/arp for known devices
-	content, err := exec.Command("cat", "/proc/net/arp").Output()
+	content, err := os.ReadFile("/proc/net/arp")
 	if err != nil {
 		return nil
 	}
@@ -1069,7 +1069,7 @@ func (s *Scanner) icmpPing(ip net.IP, timeout time.Duration) bool {
 		Body: &icmp.Echo{
 			ID:   1,
 			Seq:  1,
-			Data: []byte("netctl-ping"),
+			Data: []byte("njanet-ping"),
 		},
 	}
 
@@ -1203,7 +1203,7 @@ func (s *Scanner) Scan(ctx context.Context) (*ScanResult, error) {
 	myDev := &db.Device{
 		IP:         s.myIP.String(),
 		MAC:        strings.ToUpper(myMAC),
-		Hostname:   "netctl-host",
+		Hostname:   "njanet-host",
 		Vendor:     s.LookupVendor(strings.ToUpper(myMAC)),
 		DeviceType: "computer",
 		Online:     true,

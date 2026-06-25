@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,10 +20,9 @@ import (
 	"github.com/mectov/njanet/internal/scanner"
 )
 
-const (
-	dbPath = "/home/mectov/.njanet/njanet.db"
-	apiPort = 8484
-)
+var dbPath string
+
+const apiPort = 8484
 
 func main() {
 	if len(os.Args) < 2 {
@@ -30,7 +31,7 @@ func main() {
 	}
 
 	// Determine network interface
-	ifaceName := os.Getenv("NETCTL_IFACE")
+	ifaceName := os.Getenv("NJANET_IFACE")
 	if ifaceName == "" {
 			ifaceName = autoDetectInterface()
 	}
@@ -87,7 +88,7 @@ Usage:
   njanet monitor           Live monitor network
 
 Environment:
-  NETCTL_IFACE  Network interface (default: enp2s0)
+  NJANET_IFACE  Network interface (default: enp2s0)
 
 Examples:
   njanet scan
@@ -122,8 +123,8 @@ func initController(ifaceName string) *controller.Controller {
 }
 
 func autoDetectInterface() string {
-	// Try NETCTL_IFACE env first
-	if env := os.Getenv("NETCTL_IFACE"); env != "" {
+	// Try NJANET_IFACE env first
+	if env := os.Getenv("NJANET_IFACE"); env != "" {
 		return env
 	}
 	// Auto-detect: find interface with default route + IPv4
@@ -300,6 +301,10 @@ func cmdProtect(ifaceName string) {
 			return
 		}
 		target := os.Args[3]
+		if !isValidIP(target) && !isValidMAC(target) {
+			fmt.Fprintf(os.Stderr, "Invalid IP or MAC address: %s\n", target)
+			os.Exit(1)
+		}
 		label := ""
 		if len(os.Args) >= 5 {
 			label = os.Args[4]
@@ -326,6 +331,10 @@ func cmdProtect(ifaceName string) {
 			return
 		}
 		target := os.Args[3]
+		if !isValidIP(target) && !isValidMAC(target) {
+			fmt.Fprintf(os.Stderr, "Invalid IP or MAC address: %s\n", target)
+			os.Exit(1)
+		}
 		// Remove by MAC and by IP (for backward compatibility)
 		mac, _ := database.FindMACByIP(target)
 		if mac != "" {
@@ -374,6 +383,10 @@ func cmdRename(ifaceName string) {
 		return
 	}
 	target := os.Args[2]
+	if !isValidIP(target) && !isValidMAC(target) {
+		fmt.Fprintf(os.Stderr, "Invalid IP or MAC address: %s\n", target)
+		os.Exit(1)
+	}
 	name := os.Args[3]
 
 	database := initDB()
@@ -396,6 +409,10 @@ func cmdBlock(ifaceName string) {
 		return
 	}
 	target := os.Args[2]
+	if !isValidIP(target) && !isValidMAC(target) {
+		fmt.Fprintf(os.Stderr, "Invalid IP or MAC address: %s\n", target)
+		os.Exit(1)
+	}
 
 	database := initDB()
 	ctrl := initController(ifaceName)
@@ -420,6 +437,10 @@ func cmdUnblock(ifaceName string) {
 		return
 	}
 	target := os.Args[2]
+	if !isValidIP(target) && !isValidMAC(target) {
+		fmt.Fprintf(os.Stderr, "Invalid IP or MAC address: %s\n", target)
+		os.Exit(1)
+	}
 
 	database := initDB()
 	ctrl := initController(ifaceName)
@@ -445,6 +466,10 @@ func cmdThrottle(ifaceName string) {
 		return
 	}
 	target := os.Args[2]
+	if !isValidIP(target) && !isValidMAC(target) {
+		fmt.Fprintf(os.Stderr, "Invalid IP or MAC address: %s\n", target)
+		os.Exit(1)
+	}
 	speed, err := parseInt(os.Args[3])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid speed: %s\n", os.Args[3])
@@ -607,12 +632,18 @@ func cmdDefend(ifaceName string) {
 }
 
 func getLocalMAC(ifaceName string) string {
-	out, _ := exec.Command("cat", "/sys/class/net/"+ifaceName+"/address").Output()
-	return strings.TrimSpace(string(out))
+	data, err := os.ReadFile("/sys/class/net/" + ifaceName + "/address")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func resolveGatewayMAC() string {
-	data, _ := exec.Command("cat", "/proc/net/arp").Output()
+	data, err := os.ReadFile("/proc/net/arp")
+	if err != nil {
+		return ""
+	}
 	gatewayIP := getGatewayIP()
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
@@ -794,6 +825,28 @@ func cmdHog(ifaceName string) {
 
 // --- Helpers ---
 
+func isValidIP(ip string) bool {
+	return net.ParseIP(ip) != nil
+}
+
+func isValidMAC(mac string) bool {
+	parts := strings.Split(mac, ":")
+	if len(parts) != 6 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) != 2 {
+			return false
+		}
+		for _, c := range p {
+			if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func findDevice(target string, database *db.Database) *db.Device {
 	// Try by IP first
 	devices, _ := database.GetAllDevices()
@@ -839,17 +892,23 @@ func formatBytes(b int64) string {
 	return fmt.Sprintf("%.1f GB", float64(b)/(1024*1024*1024))
 }
 
-// For JSON pretty printing
 func init() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: cannot get home dir: %v, using /tmp\n", err)
+		home = "/tmp"
+	}
+	dbPath = filepath.Join(home, ".njanet", "njanet.db")
+
 	// Handle JSON output for commands
 	if len(os.Args) > 1 && os.Args[1] == "--json" {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
-		os.Setenv("NETCTL_JSON", "1")
+		os.Setenv("NJANET_JSON", "1")
 	}
 }
 
 func printJSON(v interface{}) {
-	if os.Getenv("NETCTL_JSON") == "1" {
+	if os.Getenv("NJANET_JSON") == "1" {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		enc.Encode(v)

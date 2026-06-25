@@ -4,12 +4,10 @@
 *.db-shm
 *.db-wal2
 .DS_Store
-netctl
 njanet
 .vscode
 __pycache__/
 *.pyc
 *.pyo
-cmd/netctl/cmd/netctl
 njanet.db
 .njanet/

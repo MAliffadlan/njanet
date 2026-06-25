@@ -329,12 +329,18 @@ func (c *Controller) stopARPSpoof(targetIP string) {
 }
 
 func (c *Controller) getMyMAC() string {
-	out, _ := exec.Command("cat", "/sys/class/net/"+c.iface+"/address").Output()
-	return strings.TrimSpace(string(out))
+	data, err := os.ReadFile("/sys/class/net/" + c.iface + "/address")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func (c *Controller) getGatewayMAC() string {
-	data, _ := exec.Command("cat", "/proc/net/arp").Output()
+	data, err := os.ReadFile("/proc/net/arp")
+	if err != nil {
+		return ""
+	}
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 4 && f[0] == c.gatewayIP {
@@ -345,19 +351,23 @@ func (c *Controller) getGatewayMAC() string {
 }
 
 func (c *Controller) getMAC(ip string) string {
-	data, _ := exec.Command("cat", "/proc/net/arp").Output()
-	for _, line := range strings.Split(string(data), "\n") {
-		f := strings.Fields(line)
-		if len(f) >= 4 && f[0] == ip && f[3] != "(incomplete)" {
-			return strings.ToUpper(f[3])
+	data, err := os.ReadFile("/proc/net/arp")
+	if err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 4 && f[0] == ip && f[3] != "(incomplete)" {
+				return strings.ToUpper(f[3])
+			}
 		}
 	}
 	exec.Command("ping", "-c", "1", "-W", "1", ip).Run()
-	data2, _ := exec.Command("cat", "/proc/net/arp").Output()
-	for _, line := range strings.Split(string(data2), "\n") {
-		f := strings.Fields(line)
-		if len(f) >= 4 && f[0] == ip && f[3] != "(incomplete)" {
-			return strings.ToUpper(f[3])
+	data2, err := os.ReadFile("/proc/net/arp")
+	if err == nil {
+		for _, line := range strings.Split(string(data2), "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 4 && f[0] == ip && f[3] != "(incomplete)" {
+				return strings.ToUpper(f[3])
+			}
 		}
 	}
 	return ""
