@@ -75,6 +75,7 @@ Usage:
   njanet defend            ARP spoof defense (deteksi + counter)
   njanet monitor           Live scan tiap 5 detik
   njanet rename <ip> <name>  Beri nama perangkat
+  njanet router            Scan web interface router
   njanet stats             Statistik jaringan
   njanet reset             Reset semua aturan
 ```
