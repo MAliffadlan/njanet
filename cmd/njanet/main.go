@@ -43,6 +43,8 @@ func main() {
 		cmdHog(ifaceName)
 	case "reset":
 		cmdReset(ifaceName)
+	case "router":
+		cmdRouter(ifaceName)
 	case "stats":
 		cmdStats(ifaceName)
 	case "defend":
@@ -70,6 +72,7 @@ Usage:
   njanet stats             Show network stats
   njanet defend            ARP spoof defense monitor
   njanet reset             Reset all rules
+  njanet router            Scan router web interface
   njanet monitor           Live monitor network
 
 Environment:
@@ -83,10 +86,18 @@ Examples:
 }
 
 func init() {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: cannot get home dir: %v, using /tmp\n", err)
-		home = "/tmp"
+	home := os.Getenv("HOME")
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+		// When running with sudo, use the original user's home
+		home = "/home/" + sudoUser
+	}
+	if home == "" {
+		var err error
+		home, err = os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: cannot get home dir: %v, using /tmp\n", err)
+			home = "/tmp"
+		}
 	}
 	dbPath = filepath.Join(home, ".njanet", "njanet.db")
 
