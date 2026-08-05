@@ -30,9 +30,9 @@ type DeviceRule struct {
 }
 
 const (
-	htbHandle     = "1:"
-	defaultClass  = "1:10"
-	defaultRate   = "1000mbit"
+	htbHandle    = "1:"
+	defaultClass = "1:10"
+	defaultRate  = "1000mbit"
 )
 
 func New(iface, myIP, gatewayIP string) *Controller {
@@ -56,7 +56,7 @@ func New(iface, myIP, gatewayIP string) *Controller {
 	return c
 }
 
-func (c *Controller) IsReady() bool         { return c.ready }
+func (c *Controller) IsReady() bool { return c.ready }
 func (c *Controller) checkRoot() error {
 	if !c.ready {
 		return fmt.Errorf("root required: run with sudo for block/throttle")
@@ -111,7 +111,12 @@ func (c *Controller) ThrottleDevice(dev *db.Device, speedKbps int) error {
 	}
 	classStr := fmt.Sprintf("1:%d", classID)
 
+	// Create the class; if it already exists (e.g. re-throttle in the watch mode
+	// after an IP change), class add fails and class change updates the rate.
 	exec.Command("tc", "class", "add", "dev", c.iface,
+		"parent", htbHandle, "classid", classStr,
+		"htb", "rate", rate, "ceil", rate, "burst", burst).Run()
+	exec.Command("tc", "class", "change", "dev", c.iface,
 		"parent", htbHandle, "classid", classStr,
 		"htb", "rate", rate, "ceil", rate, "burst", burst).Run()
 	exec.Command("tc", "filter", "add", "dev", c.iface,
@@ -127,6 +132,8 @@ func (c *Controller) ThrottleDevice(dev *db.Device, speedKbps int) error {
 func (c *Controller) removeThrottle(dev *db.Device) error {
 	rule, ok := c.activeDevices[dev.MAC]
 	if !ok || rule.ClassID == 0 {
+		// No in-memory rule. tc state never survives across sessions anyway:
+		// initQdisc() deletes the root qdisc (and all classes/filters) at startup.
 		return nil
 	}
 	classStr := fmt.Sprintf("1:%d", rule.ClassID)
@@ -166,27 +173,34 @@ func (c *Controller) UnblockDevice(dev *db.Device) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	rule, ok := c.activeDevices[dev.MAC]
-	if !ok || !rule.Blocked {
-		return nil
-	}
 	c.stopARPSpoof(dev.IP)
+	// Delete the FORWARD DROP rules by IP even when this process has no in-memory
+	// rule (e.g. the device was blocked in a previous session) — the rules live in
+	// iptables, not in memory.
+	c.RemoveForwardDropRules(dev.IP)
+	if rule, ok := c.activeDevices[dev.MAC]; ok {
+		rule.Blocked = false
+	}
+	return nil
+}
+
+// RemoveForwardDropRules deletes only the FORWARD DROP rules NjaNet itself
+// created for the given IP. Never flush whole chains: that would wipe other
+// firewall rules (ufw/firewalld, manual rules, ...).
+func (c *Controller) RemoveForwardDropRules(ip string) {
 	for _, args := range [][]string{
-		{"iptables", "-D", "FORWARD", "-d", dev.IP, "-j", "DROP"},
-		{"iptables", "-D", "FORWARD", "-s", dev.IP, "-j", "DROP"},
+		{"iptables", "-D", "FORWARD", "-d", ip, "-j", "DROP"},
+		{"iptables", "-D", "FORWARD", "-s", ip, "-j", "DROP"},
 	} {
 		exec.Command(args[0], args[1:]...).Run()
 	}
-	rule.Blocked = false
-	return nil
 }
 
 func (c *Controller) Reset() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	exec.Command("iptables", "-F", "FORWARD").Run()
-	exec.Command("iptables", "-F", "INPUT").Run()
-	exec.Command("iptables", "-F", "OUTPUT").Run()
+	// Remove the qdisc (deletes all NjaNet tc classes/filters) and stop spoofing.
+	// iptables cleanup for individual devices is handled via RemoveForwardDropRules.
 	c.initQdisc()
 	for key, cmd := range c.spoofProcs {
 		cmd.Process.Kill()
@@ -195,17 +209,6 @@ func (c *Controller) Reset() error {
 	}
 	c.activeDevices = make(map[string]*DeviceRule)
 	return nil
-}
-
-func (c *Controller) GetActiveRules() map[string]*DeviceRule {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	rules := make(map[string]*DeviceRule)
-	for k, v := range c.activeDevices {
-		cp := *v
-		rules[k] = &cp
-	}
-	return rules
 }
 
 func (c *Controller) getOrCreateRule(dev *db.Device) *DeviceRule {
@@ -231,29 +234,6 @@ func (c *Controller) nextClassID() int {
 		}
 	}
 	return 99
-}
-
-func (c *Controller) GetTrafficStats() (map[string]int64, error) {
-	output, err := exec.Command("tc", "-s", "class", "show", "dev", c.iface).Output()
-	if err != nil {
-		return nil, err
-	}
-	stats := make(map[string]int64)
-	lines := strings.Split(string(output), "\n")
-	for i, line := range lines {
-		if strings.Contains(line, "class htb 1:") && i+1 < len(lines) {
-			parts := strings.Fields(line)
-			if len(parts) >= 3 {
-				stats[parts[2]] = 0
-				if strings.Contains(lines[i+1], "bytes") {
-					var b int64
-					fmt.Sscanf(strings.Fields(lines[i+1])[0], "%d", &b)
-					stats[parts[2]] = b
-				}
-			}
-		}
-	}
-	return stats, nil
 }
 
 // --- ARP Spoofing ---

@@ -8,8 +8,6 @@ import (
 
 var dbPath string
 
-const apiPort = 8484
-
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -25,8 +23,6 @@ func main() {
 	switch cmd {
 	case "scan":
 		cmdScan(ifaceName)
-	case "web":
-		cmdWeb(ifaceName)
 	case "list", "ls":
 		cmdList(ifaceName)
 	case "protect":
@@ -81,8 +77,7 @@ Environment:
 Examples:
   njanet scan
   njanet block 192.168.1.100
-  njanet throttle 192.168.1.100 1024
-`)
+  njanet throttle 192.168.1.100 1024`)
 }
 
 func init() {
@@ -100,9 +95,4 @@ func init() {
 		}
 	}
 	dbPath = filepath.Join(home, ".njanet", "njanet.db")
-
-	if len(os.Args) > 1 && os.Args[1] == "--json" {
-		os.Args = append(os.Args[:1], os.Args[2:]...)
-		os.Setenv("NJANET_JSON", "1")
-	}
 }

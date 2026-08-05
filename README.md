@@ -12,7 +12,7 @@
 
 ## **1. Overview**
 
-**NjaNet** adalah tool CLI berbasis Go untuk kontrol jaringan WiFi — scan perangkat, batasi kecepatan, blokir koneksi, dan lindungi jaringan dari ARP spoofing. Dibangun tanpa dependency Python, satu binary siap pakai.
+**NjaNet** adalah tool CLI berbasis Go untuk kontrol jaringan WiFi — scan perangkat, batasi kecepatan, blokir koneksi, dan lindungi jaringan dari ARP spoofing. Dikemas dalam satu binary Go siap pakai. ARP spoof memakai tool `dsniff` (`arpspoof`), dengan fallback Python bawaan otomatis jika `arpspoof` belum terpasang.
 
 ## **2. Persiapan**
 
@@ -163,7 +163,7 @@ sudo njanet reset
 
 # ARP spoof nyangkut dari session sebelumnya
 sudo pkill -9 arpspoof
-sudo iptables -F FORWARD
+sudo njanet reset
 ```
 
 ## **9. Struktur Project**
@@ -174,8 +174,7 @@ njanet/
 ├── internal/
 │   ├── scanner/                 # Scanner (ARP, nmap, ping, defense)
 │   ├── controller/              # Block, throttle, ARP spoof
-│   ├── db/                      # SQLite database
-│   └── api/                     # REST API
+│   └── db/                      # SQLite database
 ├── go.mod
 └── README.md
 ```

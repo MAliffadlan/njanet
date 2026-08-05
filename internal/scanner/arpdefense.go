@@ -176,7 +176,7 @@ func (d *ARPDefender) counterMeasure(alert ARPSpoofAlert) {
 	// Force correct static ARP entry
 	exec.Command("arp", "-s", alert.VictimIP, alert.RealMAC).Run()
 
-	if alert.SpooferIP != "" && alert.SpooferIP != "" && d.verbose {
+	if alert.SpooferIP != "" && d.verbose {
 		fmt.Printf("   ✅ Fixed: %s → %s\n", alert.VictimIP, alert.RealMAC)
 	}
 

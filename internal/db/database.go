@@ -61,41 +61,6 @@ func (d *Database) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_devices_mac ON devices(mac);
 	CREATE INDEX IF NOT EXISTS idx_devices_online ON devices(online);
 
-	CREATE TABLE IF NOT EXISTS traffic_log (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		device_id INTEGER REFERENCES devices(id),
-		mac TEXT NOT NULL,
-		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-		bytes_in INTEGER DEFAULT 0,
-		bytes_out INTEGER DEFAULT 0,
-		dest_ip TEXT DEFAULT '',
-		dest_port INTEGER DEFAULT 0,
-		protocol TEXT DEFAULT '',
-		host TEXT DEFAULT ''
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_traffic_mac ON traffic_log(mac);
-	CREATE INDEX IF NOT EXISTS idx_traffic_time ON traffic_log(timestamp);
-
-	CREATE TABLE IF NOT EXISTS block_rules (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		device_id INTEGER REFERENCES devices(id),
-		mac TEXT NOT NULL,
-		active BOOLEAN DEFAULT 1,
-		schedule_start TEXT DEFAULT '',
-		schedule_end TEXT DEFAULT '',
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE TABLE IF NOT EXISTS speed_rules (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		device_id INTEGER REFERENCES devices(id),
-		mac TEXT NOT NULL,
-		speed_kbps INTEGER NOT NULL,
-		active BOOLEAN DEFAULT 1,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);
-
 	CREATE TABLE IF NOT EXISTS scan_history (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		scanned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -120,7 +85,16 @@ func (d *Database) migrate() error {
 	);
 
 	`
-	_, err := d.Exec(schema)
+	if _, err := d.Exec(schema); err != nil {
+		return err
+	}
+
+	// Older databases were created without a UNIQUE constraint on watchlist.mac,
+	// which made AddWatch's INSERT OR REPLACE insert duplicate rows. Dedupe and index.
+	if _, err := d.Exec(`DELETE FROM watchlist WHERE id NOT IN (SELECT MIN(id) FROM watchlist GROUP BY mac)`); err != nil {
+		return err
+	}
+	_, err := d.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_mac ON watchlist(mac)`)
 	return err
 }
 
@@ -184,33 +158,6 @@ func (d *Database) GetAllDevices() ([]*Device, error) {
 	return devices, nil
 }
 
-func (d *Database) GetDeviceByMAC(mac string) (*Device, error) {
-	dev := &Device{}
-	var firstSeen, lastSeen, openPorts string
-	err := d.QueryRow(`
-		SELECT id, ip, mac, hostname, vendor, device_type,
-			first_seen, last_seen, online, signal, rssi,
-			traffic_in, traffic_out, blocked, speed_limit,
-			priority, nickname, is_wireless, open_ports
-		FROM devices WHERE mac = ?`, mac).Scan(
-		&dev.ID, &dev.IP, &dev.MAC, &dev.Hostname, &dev.Vendor,
-		&dev.DeviceType, &firstSeen, &lastSeen, &dev.Online,
-		&dev.Signal, &dev.RSSI, &dev.TrafficIn, &dev.TrafficOut,
-		&dev.Blocked, &dev.SpeedLimit, &dev.Priority, &dev.Nickname,
-		&dev.IsWireless, &openPorts)
-	if err != nil {
-		return nil, err
-	}
-	dev.FirstSeen, _ = time.Parse("2006-01-02 15:04:05", firstSeen)
-	dev.LastSeen, _ = time.Parse("2006-01-02 15:04:05", lastSeen)
-	return dev, nil
-}
-
-func (d *Database) UpdateDeviceOnline(mac string, online bool) error {
-	_, err := d.Exec("UPDATE devices SET online = ?, last_seen = CURRENT_TIMESTAMP WHERE mac = ?", online, mac)
-	return err
-}
-
 func (d *Database) UpdateDeviceBlock(mac string, blocked bool) error {
 	_, err := d.Exec("UPDATE devices SET blocked = ? WHERE mac = ?", blocked, mac)
 	return err
@@ -226,101 +173,6 @@ func (d *Database) UpdateDeviceNickname(mac, nickname string) error {
 	return err
 }
 
-func (d *Database) DeleteDevice(mac string) error {
-	_, err := d.Exec("DELETE FROM devices WHERE mac = ?", mac)
-	return err
-}
-
-// --- Traffic ---
-
-func (d *Database) LogTraffic(t *TrafficRecord) error {
-	_, err := d.Exec(`
-		INSERT INTO traffic_log (device_id, mac, bytes_in, bytes_out, dest_ip, dest_port, protocol, host)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.DeviceID, t.MAC, t.BytesIn, t.BytesOut, t.DestIP, t.DestPort, t.Protocol, t.Host)
-	return err
-}
-
-func (d *Database) GetTrafficByMAC(mac string, since time.Time) ([]*TrafficRecord, error) {
-	rows, err := d.Query(`
-		SELECT id, device_id, mac, timestamp, bytes_in, bytes_out, dest_ip, dest_port, protocol, host
-		FROM traffic_log WHERE mac = ? AND timestamp >= ? ORDER BY timestamp DESC LIMIT 100`,
-		mac, since)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var records []*TrafficRecord
-	for rows.Next() {
-		t := &TrafficRecord{}
-		var ts string
-		if err := rows.Scan(&t.ID, &t.DeviceID, &t.MAC, &ts, &t.BytesIn, &t.BytesOut,
-			&t.DestIP, &t.DestPort, &t.Protocol, &t.Host); err != nil {
-			return nil, err
-		}
-		t.Timestamp, _ = time.Parse("2006-01-02 15:04:05", ts)
-		records = append(records, t)
-	}
-	return records, nil
-}
-
-func (d *Database) GetTopTalkers(limit int) ([]*Device, error) {
-	rows, err := d.Query(`
-		SELECT ip, mac, hostname, vendor, traffic_in, traffic_out
-		FROM devices WHERE online = 1
-		ORDER BY (traffic_in + traffic_out) DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var devices []*Device
-	for rows.Next() {
-		dev := &Device{}
-		if err := rows.Scan(&dev.IP, &dev.MAC, &dev.Hostname, &dev.Vendor,
-			&dev.TrafficIn, &dev.TrafficOut); err != nil {
-			return nil, err
-		}
-		devices = append(devices, dev)
-	}
-	return devices, nil
-}
-
-// --- Block/Speed Rules ---
-
-func (d *Database) AddBlockRule(mac string, deviceID int64) error {
-	_, err := d.Exec("INSERT INTO block_rules (mac, device_id) VALUES (?, ?)", mac, deviceID)
-	return err
-}
-
-func (d *Database) RemoveBlockRule(mac string) error {
-	_, err := d.Exec("DELETE FROM block_rules WHERE mac = ?", mac)
-	return err
-}
-
-func (d *Database) GetBlockRules() ([]*BlockRule, error) {
-	rows, err := d.Query("SELECT id, device_id, mac, active, schedule_start, schedule_end, created_at FROM block_rules WHERE active = 1")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var rules []*BlockRule
-	for rows.Next() {
-		r := &BlockRule{}
-		var createdAt string
-		if err := rows.Scan(&r.ID, &r.DeviceID, &r.MAC, &r.Active,
-			&r.ScheduleStart, &r.ScheduleEnd, &createdAt); err != nil {
-			return nil, err
-		}
-		r.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
-		rules = append(rules, r)
-	}
-	return rules, nil
-}
-
-
 // --- Protected Devices (by MAC) ---
 
 func (d *Database) AddProtectedMAC(mac, label string) error {
@@ -329,10 +181,7 @@ func (d *Database) AddProtectedMAC(mac, label string) error {
 }
 
 func (d *Database) RemoveProtectedMAC(mac string) error {
-	// Remove by exact MAC
 	_, err := d.Exec("DELETE FROM protected_ips WHERE ip = ?", mac)
-	// Also try removing by IP (for backward compatibility)
-	d.Exec("DELETE FROM protected_ips WHERE ip = ?", mac)
 	return err
 }
 
@@ -362,12 +211,6 @@ func (d *Database) FindMACByIP(ip string) (string, error) {
 	var mac string
 	err := d.QueryRow("SELECT mac FROM devices WHERE ip = ?", ip).Scan(&mac)
 	return mac, err
-}
-
-func (d *Database) IsProtectedMAC(mac string) (bool, error) {
-	var count int
-	err := d.QueryRow("SELECT COUNT(*) FROM protected_ips WHERE ip = ?", mac).Scan(&count)
-	return count > 0, err
 }
 
 // --- Watchlist ---
@@ -426,32 +269,4 @@ func (d *Database) DeactivateWatch(mac string) error {
 func (d *Database) LogScan(total, online int) error {
 	_, err := d.Exec("INSERT INTO scan_history (total_devices, online_devices) VALUES (?, ?)", total, online)
 	return err
-}
-
-func (d *Database) GetRecentScans(limit int) ([]struct{ ScannedAt time.Time; Total, Online int }, error) {
-	rows, err := d.Query(
-		"SELECT scanned_at, total_devices, online_devices FROM scan_history ORDER BY scanned_at DESC LIMIT ?",
-		limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var scans []struct {
-		ScannedAt time.Time
-		Total, Online int
-	}
-	for rows.Next() {
-		var s struct {
-			ScannedAt time.Time
-			Total, Online int
-		}
-		var ts string
-		if err := rows.Scan(&ts, &s.Total, &s.Online); err != nil {
-			return nil, err
-		}
-		s.ScannedAt, _ = time.Parse("2006-01-02 15:04:05", ts)
-		scans = append(scans, s)
-	}
-	return scans, nil
 }

@@ -80,8 +80,8 @@ func New(ifaceName string) (*Scanner, error) {
 	}, nil
 }
 
-func (s *Scanner) MyIP() net.IP       { return s.myIP }
-func (s *Scanner) Subnet() *net.IPNet { return s.subnet }
+func (s *Scanner) MyIP() net.IP              { return s.myIP }
+func (s *Scanner) Subnet() *net.IPNet        { return s.subnet }
 func (s *Scanner) Interface() *net.Interface { return s.iface }
 
 // LoadOUI loads embedded manufacturer database
@@ -438,54 +438,54 @@ func (s *Scanner) LoadOUI() error {
 
 		// Random/PC vendors
 
-	// More Campus / Indonesian common vendors
-	"CC:2D:21": "Tenda",
-	"D0:C5:D3": "AzureWave",
-	"C4:FE:5B": "OPPO",
-	"30:F6:EF": "Tenda",
-	"8C:A9:82": "Xiaomi",
-	"C8:5B:76": "Huawei",
-	"F4:1E:57": "TP-Link",
-	"EC:2E:4E": "Huawei",
-	"5C:02:14": "Vivo",
-	"A8:72:2D": "OnePlus",
-	"90:4A:1C": "Nokia",
-	"28:E3:47": "Samsung",
-	"DC:2C:6E": "Cisco Meraki",
-	"20:2B:20": "Samsung",
-	"74:AC:B9": "Huawei",
-	"14:14:16": "Xiaomi",
-	"F8:D1:11": "Huawei",
-	"18:02:AE": "Xiaomi",
-	"50:C2:E8": "Intel",
-	"34:02:86": "Samsung",
-	"CC:B8:5E": "Intel",
-	"00:80:48": "Xerox",
-	"00:1D:60": "Foxconn",
-	"38:D5:47": "Lenovo",
-	"00:1B:24": "Lenovo",
-	"00:21:CC": "Lenovo",
-	"B8:88:E3": "Lenovo",
-	"E4:1F:13": "Lenovo",
-	"FC:AA:14": "Lenovo",
-	"00:09:0D": "Acer",
-	"00:1C:25": "Acer",
-	"00:23:5A": "Acer",
-	"F8:2F:A8": "Acer",
-	"2C:FD:A1": "Acer",
-	"00:1E:58": "Toshiba",
-	"00:24:4B": "Toshiba",
-	"00:17:08": "Panasonic",
-	"00:1C:CE": "Panasonic",
-	"00:24:44": "Panasonic",
-	"00:1D:7D": "Sharp",
-	"00:03:77": "Palm",
-	"00:0D:4E": "Palm",
-	// Automotive
-	"00:01:5E": "Tesla",
-	"98:F0:AB": "Tesla",
-	"00:04:3E": "Ford",
-	"00:1B:EB": "BMW",
+		// More Campus / Indonesian common vendors
+		"CC:2D:21": "Tenda",
+		"D0:C5:D3": "AzureWave",
+		"C4:FE:5B": "OPPO",
+		"30:F6:EF": "Tenda",
+		"8C:A9:82": "Xiaomi",
+		"C8:5B:76": "Huawei",
+		"F4:1E:57": "TP-Link",
+		"EC:2E:4E": "Huawei",
+		"5C:02:14": "Vivo",
+		"A8:72:2D": "OnePlus",
+		"90:4A:1C": "Nokia",
+		"28:E3:47": "Samsung",
+		"DC:2C:6E": "Cisco Meraki",
+		"20:2B:20": "Samsung",
+		"74:AC:B9": "Huawei",
+		"14:14:16": "Xiaomi",
+		"F8:D1:11": "Huawei",
+		"18:02:AE": "Xiaomi",
+		"50:C2:E8": "Intel",
+		"34:02:86": "Samsung",
+		"CC:B8:5E": "Intel",
+		"00:80:48": "Xerox",
+		"00:1D:60": "Foxconn",
+		"38:D5:47": "Lenovo",
+		"00:1B:24": "Lenovo",
+		"00:21:CC": "Lenovo",
+		"B8:88:E3": "Lenovo",
+		"E4:1F:13": "Lenovo",
+		"FC:AA:14": "Lenovo",
+		"00:09:0D": "Acer",
+		"00:1C:25": "Acer",
+		"00:23:5A": "Acer",
+		"F8:2F:A8": "Acer",
+		"2C:FD:A1": "Acer",
+		"00:1E:58": "Toshiba",
+		"00:24:4B": "Toshiba",
+		"00:17:08": "Panasonic",
+		"00:1C:CE": "Panasonic",
+		"00:24:44": "Panasonic",
+		"00:1D:7D": "Sharp",
+		"00:03:77": "Palm",
+		"00:0D:4E": "Palm",
+		// Automotive
+		"00:01:5E": "Tesla",
+		"98:F0:AB": "Tesla",
+		"00:04:3E": "Ford",
+		"00:1B:EB": "BMW",
 	}
 
 	for k, v := range builtin {
@@ -596,7 +596,7 @@ func (s *Scanner) ARPScan(ctx context.Context) ([]*db.Device, error) {
 		}
 	}
 
-		// Fall back to nmap ARP scan
+	// Fall back to nmap ARP scan
 	if nmapPath, err := exec.LookPath("nmap"); err == nil {
 		devices, _ = s.nmapARPScan(ctx, nmapPath)
 		if len(devices) > 1 {
