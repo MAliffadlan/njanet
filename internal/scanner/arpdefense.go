@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -82,7 +83,7 @@ func (d *ARPDefender) Stop() {
 // readARP reads the current ARP table as map[IP]MAC
 func (d *ARPDefender) readARP() map[string]string {
 	table := make(map[string]string)
-	data, err := exec.Command("cat", "/proc/net/arp").Output()
+	data, err := os.ReadFile("/proc/net/arp")
 	if err != nil {
 		return table
 	}

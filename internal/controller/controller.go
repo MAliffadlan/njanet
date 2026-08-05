@@ -279,16 +279,12 @@ def arp(iface, sm, si, dm, di):
 	}
 
 	c1 := exec.Command(path, "-i", c.iface, "-t", targetIP, c.gatewayIP)
-	err1 := c1.Start()
-	if err1 != nil {
-	} else {
+	if err := c1.Start(); err == nil {
 		c.spoofProcs[targetIP+"_gw"] = c1
 	}
 
 	c2 := exec.Command(path, "-i", c.iface, "-t", c.gatewayIP, targetIP)
-	err2 := c2.Start()
-	if err2 != nil {
-	} else {
+	if err := c2.Start(); err == nil {
 		c.spoofProcs[targetIP+"_tgt"] = c2
 	}
 }

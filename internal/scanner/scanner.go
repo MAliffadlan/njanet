@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -19,11 +18,6 @@ import (
 	"github.com/mectov/njanet/internal/db"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
-)
-
-const (
-	vendorDBURL = "https://raw.githubusercontent.com/wireshark/wireshark/master/manuf"
-	ouiDBPath   = "/tmp/njanet_oui.db"
 )
 
 type Scanner struct {
@@ -531,7 +525,8 @@ func (s *Scanner) lookupOnline(oui string) string {
 		return ""
 	}
 	req.Header.Set("User-Agent", "NjaNet/1.0")
-	client := &http.Client{}
+	// Timeout prevents a scan from hanging when the vendor API is unreachable.
+	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return ""
@@ -540,7 +535,7 @@ func (s *Scanner) lookupOnline(oui string) string {
 	if resp.StatusCode != 200 {
 		return ""
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	result := strings.TrimSpace(string(body))
 	if len(result) > 0 && len(result) < 100 {
 		return result
@@ -1033,19 +1028,6 @@ func (s *Scanner) detectDeviceType(dev *db.Device) string {
 	return "unknown"
 }
 
-func (s *Scanner) resolveHostnameMDNS(ip string) []string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Try reverse lookup first
-	names, err := net.DefaultResolver.LookupAddr(ctx, ip)
-	if err == nil && len(names) > 0 {
-		return names
-	}
-
-	return nil
-}
-
 func (s *Scanner) tcpPing(ip net.IP, port int, timeout time.Duration) bool {
 	addr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port))
 	conn, err := net.DialTimeout("tcp", addr, timeout)
@@ -1103,13 +1085,13 @@ func (s *Scanner) icmpPing(ip net.IP, timeout time.Duration) bool {
 
 func (s *Scanner) resolveMAC(ip net.IP) string {
 	// Try reading ARP table
-	content, err := exec.Command("cat", "/proc/net/arp").Output()
+	data, err := os.ReadFile("/proc/net/arp")
 	if err != nil {
 		return ""
 	}
 
 	ipStr := ip.String()
-	scanner := bufio.NewScanner(bytes.NewReader(content))
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		fields := strings.Fields(line)
@@ -1278,19 +1260,4 @@ func (s *Scanner) Scan(ctx context.Context) (*ScanResult, error) {
 		Total:    len(allDevices),
 		Online:   onlineCount,
 	}, nil
-}
-
-// Helper to convert IP to uint32 for subnet calculation
-func ipToUint32(ip net.IP) uint32 {
-	ip = ip.To4()
-	if ip == nil {
-		return 0
-	}
-	return binary.BigEndian.Uint32(ip)
-}
-
-func uint32ToIP(n uint32) net.IP {
-	ip := make(net.IP, 4)
-	binary.BigEndian.PutUint32(ip, n)
-	return ip
 }
