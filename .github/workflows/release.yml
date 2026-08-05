@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build binaries & create release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+
+      # mattn/go-sqlite3 requires cgo; install the aarch64 cross compiler
+      # so the arm64 build (Raspberry Pi) can link sqlite3.
+      - name: Install cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build linux/amd64
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o dist/njanet-linux-amd64 ./cmd/njanet
+
+      - name: Build linux/arm64
+        env:
+          CC: aarch64-linux-gnu-gcc
+        run: |
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o dist/njanet-linux-arm64 ./cmd/njanet
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
