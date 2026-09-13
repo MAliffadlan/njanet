@@ -125,9 +125,9 @@ func cmdProtect(ifaceName string) {
 		macs, _ := database.GetProtectedMACs()
 		if len(macs) == 0 {
 			fmt.Println("No protected devices.")
-			fmt.Println("Usage: njanet protect add <ip> [label]")
-			fmt.Println("       njanet protect remove <ip>")
-			fmt.Println("       njanet protect list")
+			fmt.Println("Usage: njanet protect add <ip> [label]  (p a)")
+			fmt.Println("       njanet protect remove <ip>       (p r)")
+			fmt.Println("       njanet protect list              (p l)")
 			return
 		}
 		fmt.Println("Protected devices (excluded from hog):")
@@ -156,7 +156,7 @@ func cmdProtect(ifaceName string) {
 
 	sub := os.Args[2]
 	switch sub {
-	case "add":
+	case "add", "a":
 		if len(os.Args) < 4 {
 			fmt.Println("Usage: njanet protect add <ip>")
 			return
@@ -183,7 +183,7 @@ func cmdProtect(ifaceName string) {
 			fmt.Printf("Protected: %s (IP based - may not work across networks)\n", target)
 		}
 
-	case "remove", "rm", "delete":
+	case "remove", "rm", "delete", "r":
 		if len(os.Args) < 4 {
 			fmt.Println("Usage: njanet protect remove <ip>")
 			return
@@ -200,7 +200,7 @@ func cmdProtect(ifaceName string) {
 		database.RemoveProtectedByIP(target)
 		fmt.Printf("Removed protection: %s\n", target)
 
-	case "list", "ls":
+	case "list", "ls", "l":
 		macs, _ := database.GetProtectedMACs()
 		if len(macs) == 0 {
 			fmt.Println("No protected devices.")
@@ -229,9 +229,9 @@ func cmdProtect(ifaceName string) {
 		}
 
 	default:
-		fmt.Println("Usage: njanet protect add <ip> [label]")
-		fmt.Println("       njanet protect remove <ip>")
-		fmt.Println("       njanet protect list")
+		fmt.Println("Usage: njanet protect add <ip> [label]  (p a)")
+		fmt.Println("       njanet protect remove <ip>       (p r)")
+		fmt.Println("       njanet protect list              (p l)")
 	}
 }
 

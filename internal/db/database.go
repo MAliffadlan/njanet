@@ -84,6 +84,19 @@ func (d *Database) migrate() error {
 		active BOOLEAN DEFAULT 1
 	);
 
+	CREATE TABLE IF NOT EXISTS schedules (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		mac TEXT NOT NULL,
+		ip TEXT NOT NULL DEFAULT '',
+		action TEXT NOT NULL DEFAULT 'block',
+		speed_kbps INTEGER DEFAULT 0,
+		start_min INTEGER NOT NULL DEFAULT 0,
+		end_min INTEGER NOT NULL DEFAULT 0,
+		days TEXT NOT NULL DEFAULT '*',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE INDEX IF NOT EXISTS idx_schedules_mac ON schedules(mac);
+
 	`
 	if _, err := d.Exec(schema); err != nil {
 		return err
@@ -268,5 +281,73 @@ func (d *Database) DeactivateWatch(mac string) error {
 
 func (d *Database) LogScan(total, online int) error {
 	_, err := d.Exec("INSERT INTO scan_history (total_devices, online_devices) VALUES (?, ?)", total, online)
+	return err
+}
+
+// --- Schedules ---
+
+// Schedule is one automatic rule: during [StartMin,EndMin) on Days,
+// apply Action ("block" or "throttle" at SpeedKbps). Outside the window
+// the device is restored to normal.
+type Schedule struct {
+	ID        int64
+	MAC       string
+	IP        string
+	Action    string // "block" or "throttle"
+	SpeedKbps int
+	StartMin  int    // minutes since midnight, 0-1439
+	EndMin    int    // minutes since midnight, 0-1439
+	Days      string // "*" = daily, or comma list like "mon,tue"
+}
+
+func (d *Database) AddSchedule(mac, ip, action string, speedKbps, startMin, endMin int, days string) (int64, error) {
+	res, err := d.Exec(`INSERT INTO schedules (mac, ip, action, speed_kbps, start_min, end_min, days)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, mac, ip, action, speedKbps, startMin, endMin, days)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (d *Database) GetSchedules() ([]*Schedule, error) {
+	rows, err := d.Query(`SELECT id, mac, ip, action, speed_kbps, start_min, end_min, days
+		FROM schedules ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*Schedule
+	for rows.Next() {
+		s := &Schedule{}
+		if err := rows.Scan(&s.ID, &s.MAC, &s.IP, &s.Action, &s.SpeedKbps,
+			&s.StartMin, &s.EndMin, &s.Days); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func (d *Database) RemoveScheduleByID(id int64) (bool, error) {
+	res, err := d.Exec("DELETE FROM schedules WHERE id = ?", id)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (d *Database) RemoveScheduleByMAC(mac string) (bool, error) {
+	res, err := d.Exec("DELETE FROM schedules WHERE mac = ?", mac)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (d *Database) UpdateScheduleIP(mac, ip string) error {
+	_, err := d.Exec("UPDATE schedules SET ip = ? WHERE mac = ?", ip, mac)
 	return err
 }

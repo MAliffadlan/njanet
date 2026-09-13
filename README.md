@@ -30,6 +30,7 @@ Diperlukan:
 - Hog — batasi semua perangkat kecuali laptop sendiri
 - Protect — lindungi perangkat dari Hog (by MAC, cross-network)
 - Watch — auto-track perangkat saat IP berubah (`--watch`)
+- Schedule — blokir/batasi otomatis per jam & hari (`sched`)
 - ARP Spoof Defense — deteksi & counter serangan ARP spoof
 - Monitor — live scan otomatis tiap 5 detik
 - Rename — beri nama sendiri pada perangkat
@@ -62,48 +63,74 @@ njanet help
 ```
 
 ```
-Usage:
-  njanet scan              Scan jaringan, deteksi perangkat
-  njanet list              Lihat daftar perangkat
-  njanet throttle <ip> <kbps> [--watch]  Batasi kecepatan
-  njanet block <ip>        Putuskan koneksi
-  njanet unblock <ip>      Pulihkan koneksi
-  njanet hog <kbps>        Batasi SEMUA perangkat kecuali Anda
-  njanet protect add <ip> [label]  Lindungi dari Hog
-  njanet protect list      Lihat daftar protected
-  njanet protect remove <ip>  Hapus dari protected
-  njanet defend            ARP spoof defense (deteksi + counter)
-  njanet monitor           Live scan tiap 5 detik
-  njanet rename <ip> <name>  Beri nama perangkat
-  njanet router            Scan web interface router
-  njanet stats             Statistik jaringan
-  njanet reset             Reset semua aturan
+NjaNet v0.1 — kontrol jaringan WiFi via terminal
+
+PENGGUNAAN
+  njanet <perintah> [argumen]
+  Perintah bertanda (*) wajib sudo. Detail per perintah: njanet help <perintah>
+
+PINDAI & PANTAU
+  s, scan                   Pindai jaringan, deteksi perangkat (*)
+  l, list                   Daftar perangkat yang tersimpan
+  m, monitor                Pantau live tiap 5 detik (lebih akurat sudo)
+  st, stats                 Statistik jaringan
+  rt, router                Pindai web interface router
+
+BATASI & BLOKIR (*)
+  t, throttle IP KBPS [-w]  Batasi kecepatan (KBPS 0 = normal lagi)
+  b, block IP               Putuskan koneksi perangkat
+  ub, unblock IP            Pulihkan koneksi perangkat
+  h, hog KBPS               Batasi SEMUA perangkat kecuali laptop ini
+  d, defend                 Jaga jaringan dari serangan ARP spoof
+  rs, reset                 Hapus semua aturan NjaNet
+
+JADWAL OTOMATIS
+  sched add IP AKSI JAM [hari]  Tambah jadwal (block | KBPS, JAM 22:00-06:00)
+  sched list                    Lihat semua jadwal
+  sched remove ID|IP            Hapus jadwal
+  sched run (*)                 Jalankan penjadwal (daemon, Ctrl+C = stop)
+
+LAINNYA
+  p, protect ...            Kecualikan perangkat dari hog (add|remove|list)
+  rn, rename IP NAMA        Beri nama perangkat
+  help [perintah]           Bantuan ini / detail satu perintah
 ```
 
 **Contoh:**
 
 ```bash
+# Bantuan lengkap / detail per perintah
+njanet help
+njanet help throttle
+
 # Scan jaringan
-sudo njanet scan
+sudo njanet s
 
 # Batasi kecepatan (64 Kbps — WhatsApp saja cukup)
-sudo njanet throttle 192.168.1.8 64
+sudo njanet t 192.168.1.8 64
 
 # Batasi + auto-track jika IP berubah
-sudo njanet throttle 192.168.1.8 64 --watch
+sudo njanet t 192.168.1.8 64 --watch
 
 # Hog semua perangkat kecuali Anda
-sudo njanet hog 64
+sudo njanet h 64
 
 # Lindungi server dari Hog
-njanet protect add 192.168.1.9 "Server"
-njanet protect list
+njanet p a 192.168.1.9 "Server"
+njanet p l
 
 # Aktifkan ARP defense
-sudo njanet defend
+sudo njanet d
 
 # Monitor live
-njanet monitor
+njanet m
+
+# Jadwal: blokir HP tiap jam 12 malam – 6 pagi
+njanet sched add 192.168.1.8 block 00:00-06:00
+
+# Jadwal: lemotkan tiap malam hari kerja, daemon yang menjalankan
+njanet sched add 192.168.1.8 64 22:00-06:00 weekdays
+sudo njanet sched run
 ```
 
 <details>
@@ -170,7 +197,7 @@ sudo njanet reset
 
 ```
 njanet/
-├── cmd/njanet/main.go           # Entry point CLI
+├── cmd/njanet/                   # CLI (main, commands, schedule, helpers, setup)
 ├── internal/
 │   ├── scanner/                 # Scanner (ARP, nmap, ping, defense)
 │   ├── controller/              # Block, throttle, ARP spoof
