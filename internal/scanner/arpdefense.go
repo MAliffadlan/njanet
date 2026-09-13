@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,7 +15,7 @@ type ARPDefender struct {
 	gatewayMAC string
 	myIP       string
 	myMAC      string
-	running    bool
+	running    atomic.Bool
 	verbose    bool
 	alertFunc  func(alert ARPSpoofAlert)
 }
@@ -28,12 +29,15 @@ type ARPSpoofAlert struct {
 }
 
 func NewARPDefender(iface, gatewayIP, gatewayMAC, myIP, myMAC string) *ARPDefender {
+	// Normalisasi ke uppercase: tabel ARP dibaca dalam uppercase,
+	// sementara MAC lokal dari /sys biasanya lowercase. Tanpa ini
+	// laptop sendiri selalu dikira perangkat asing (false positive).
 	return &ARPDefender{
 		iface:      iface,
 		gatewayIP:  gatewayIP,
-		gatewayMAC: gatewayMAC,
+		gatewayMAC: strings.ToUpper(gatewayMAC),
 		myIP:       myIP,
-		myMAC:      myMAC,
+		myMAC:      strings.ToUpper(myMAC),
 	}
 }
 
@@ -43,7 +47,7 @@ func (d *ARPDefender) SetAlertFunc(f func(alert ARPSpoofAlert)) {
 
 // Start begins defense monitoring
 func (d *ARPDefender) Start(verbose bool) {
-	d.running = true
+	d.running.Store(true)
 	d.verbose = verbose
 
 	if d.verbose {
@@ -57,7 +61,7 @@ func (d *ARPDefender) Start(verbose bool) {
 	baseARP := d.readARP()
 
 	go func() {
-		for d.running {
+		for d.running.Load() {
 			alerts := d.checkARP(baseARP)
 			if d.verbose {
 				fmt.Printf("\r🛡️ ARP Defense active (%s)      ", time.Now().Format("15:04:05"))
@@ -73,7 +77,7 @@ func (d *ARPDefender) Start(verbose bool) {
 
 // Stop stops defense monitoring
 func (d *ARPDefender) Stop() {
-	d.running = false
+	d.running.Store(false)
 	if d.verbose {
 		fmt.Println()
 		fmt.Println("🛡️ ARP defense stopped")

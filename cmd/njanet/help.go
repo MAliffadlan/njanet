@@ -55,6 +55,7 @@ KETERANGAN
   KBPS 0 = kembali normal. Contoh KBPS: 16 (hampir mati), 64 (WA saja),
   256 (browsing), 1024 (hampir normal). --watch mengikuti perangkat
   kalau IP-nya berubah (DHCP). Tekan Ctrl+C untuk berhenti & memulihkan.
+  IP laptop sendiri dan gateway otomatis ditolak.
 
 CONTOH
   sudo njanet t 192.168.1.8 64
@@ -68,7 +69,8 @@ PENGGUNAAN
 
 KETERANGAN
   Perangkat tidak bisa akses internet/router sampai di-unblock.
-  Target bisa IP atau MAC.
+  Target bisa IP atau MAC. IP laptop sendiri dan gateway otomatis
+  ditolak.
 
 CONTOH
   sudo njanet b 192.168.1.8`,

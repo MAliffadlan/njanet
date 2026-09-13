@@ -289,6 +289,14 @@ func cmdBlock(ifaceName string) {
 		}
 	}
 
+	if dev.MAC == "" {
+		fmt.Fprintf(os.Stderr, "Perangkat %s tidak dikenal (MAC tidak ketemu). Jalankan 'sudo njanet scan' dan pastikan perangkat online.\n", target)
+		os.Exit(1)
+	}
+	if guardSelfTarget([]string{target, dev.IP}, ifaceName) {
+		os.Exit(1)
+	}
+
 	if err := ctrl.BlockDevice(dev); err != nil {
 		fmt.Fprintf(os.Stderr, "Block failed: %v\n", err)
 		os.Exit(1)
@@ -359,6 +367,14 @@ func cmdThrottle(ifaceName string) {
 		if resolvedMAC != "" {
 			database.UpsertDevice(dev)
 		}
+	}
+
+	if dev.MAC == "" {
+		fmt.Fprintf(os.Stderr, "Perangkat %s tidak dikenal (MAC tidak ketemu). Jalankan 'sudo njanet scan' dan pastikan perangkat online.\n", target)
+		os.Exit(1)
+	}
+	if guardSelfTarget([]string{target, dev.IP}, ifaceName) {
+		os.Exit(1)
 	}
 
 	watchMode := false
@@ -478,6 +494,7 @@ func cmdHog(ifaceName string) {
 	}
 
 	myIP := getMyIP(ifaceName)
+	gatewayIP := getGatewayIP()
 	fmt.Printf("   Your IP: %s\n", myIP)
 	fmt.Printf("   Devices found: %d\n", len(result.Devices))
 	fmt.Println()
@@ -495,6 +512,10 @@ func cmdHog(ifaceName string) {
 	for _, dev := range result.Devices {
 		if dev.IP == myIP {
 			fmt.Printf("   ⏭️  Skip: %s (your device)\n", dev.IP)
+			continue
+		}
+		if dev.IP == gatewayIP {
+			fmt.Printf("   ⏭️  Skip: %s (gateway)\n", dev.IP)
 			continue
 		}
 		if protected[dev.MAC] {
@@ -523,7 +544,7 @@ func cmdHog(ifaceName string) {
 
 	fmt.Println("\n🔄 Restoring all devices...")
 	for _, dev := range result.Devices {
-		if dev.IP == myIP || dev.MAC == "00:00:00:00:00:00" {
+		if dev.IP == myIP || dev.IP == gatewayIP || dev.MAC == "00:00:00:00:00:00" {
 			continue
 		}
 		if protected[dev.MAC] {

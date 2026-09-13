@@ -23,7 +23,7 @@ func cmdSchedule(ifaceName string) {
 	}
 	switch os.Args[2] {
 	case "add", "a":
-		schedAdd()
+		schedAdd(ifaceName)
 	case "remove", "rm", "r", "del", "delete":
 		schedRemove()
 	case "list", "ls", "l":
@@ -53,7 +53,7 @@ Window boleh lewat tengah malam, mis. 22:00-06:00.`)
 
 // --- add ---
 
-func schedAdd() {
+func schedAdd(ifaceName string) {
 	if len(os.Args) < 6 {
 		printSchedUsage()
 		return
@@ -98,6 +98,15 @@ func schedAdd() {
 	mac, ip := resolveSchedTarget(target, database)
 	if mac == "" {
 		fmt.Fprintf(os.Stderr, "Perangkat %s tidak dikenal. Jalankan 'sudo njanet scan' dulu dan pastikan perangkat online.\n", target)
+		os.Exit(1)
+	}
+
+	// Jangan izinkan jadwal untuk laptop sendiri / gateway.
+	cands := []string{ip}
+	if isValidIP(target) {
+		cands = append(cands, target)
+	}
+	if guardSelfTarget(cands, ifaceName) {
 		os.Exit(1)
 	}
 
@@ -316,10 +325,12 @@ func cmdSchedRun(ifaceName string) {
 
 	applied := make(map[string]appliedSched)
 	unknown := make(map[string]bool)
+	selfWarned := make(map[string]bool)
 
 	tick := func() {
 		now := time.Now()
 		nowMin := now.Hour()*60 + now.Minute()
+		myIP, gwIP := getMyIP(ifaceName), getGatewayIP()
 		schedules, err := database.GetSchedules()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] db error: %v\n", ts(), err)
@@ -338,6 +349,22 @@ func cmdSchedRun(ifaceName string) {
 			}
 
 			cur, ok := applied[sc.MAC]
+
+			// Target ternyata IP sendiri/gateway (mis. ganti jaringan):
+			// jangan pernah terapkan, bersihkan bila sempat teraplikasi.
+			if ip == myIP || ip == gwIP {
+				if ok {
+					revertSched(ctrl, database, sc.MAC, cur)
+					delete(applied, sc.MAC)
+				}
+				if !selfWarned[sc.MAC] {
+					fmt.Printf("[%s] ⏭️  Jadwal #%d menunjuk %s (perangkat sendiri/gateway) — dilewati\n",
+						ts(), sc.ID, ip)
+					selfWarned[sc.MAC] = true
+				}
+				continue
+			}
+			delete(selfWarned, sc.MAC)
 
 			if want && ip == "" {
 				// Perangkat hilang dari jaringan — bersihkan aturan basi.

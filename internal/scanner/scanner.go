@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -722,20 +723,9 @@ func (s *Scanner) nmapARPScan(ctx context.Context, nmapPath string) ([]*db.Devic
 
 // pingSweep pings subnet to populate ARP cache (fast)
 func (s *Scanner) pingSweep() {
-	ones, bits := s.subnet.Mask.Size()
-	n := 1 << uint(bits-ones)
-	if n > 512 {
-		n = 512
-	}
-	ip := make(net.IP, len(s.myIP))
-	copy(ip, s.myIP)
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 50)
-	for i := 1; i < n; i++ {
-		ip[3] = byte(i)
-		if ip.Equal(s.myIP) {
-			continue
-		}
+	for _, ip := range s.hostAddrs(512) {
 		sem <- struct{}{}
 		wg.Add(1)
 		go func(addr string) {
@@ -1137,20 +1127,29 @@ func isMulticastMAC(mac string) bool {
 }
 
 func (s *Scanner) networkHosts() []net.IP {
-	var ips []net.IP
+	return s.hostAddrs(1024) // limit scan to /22 worth of hosts
+}
+
+// hostAddrs enumerates up to limit host IPs in the interface subnet
+// (excluding our own IP), using real subnet arithmetic so any mask
+// (/24, /23, /16, ...) works — not just the last octet.
+func (s *Scanner) hostAddrs(limit int) []net.IP {
+	base := s.subnet.IP.Mask(s.subnet.Mask).To4()
+	if base == nil {
+		return nil
+	}
 	ones, bits := s.subnet.Mask.Size()
 	numIPs := 1 << uint(bits-ones)
-	if numIPs > 1024 {
-		numIPs = 1024 // limit scan to /22
+	if numIPs > limit {
+		numIPs = limit
 	}
-
-	ip := make(net.IP, len(s.myIP))
-	copy(ip, s.myIP)
+	baseU := binary.BigEndian.Uint32(base)
+	var ips []net.IP
 	for i := 0; i < numIPs; i++ {
-		ip[3] = byte(i)
+		ip := make(net.IP, net.IPv4len)
+		binary.BigEndian.PutUint32(ip, baseU+uint32(i))
 		if !ip.Equal(s.myIP) {
-			ips = append(ips, make(net.IP, len(ip)))
-			copy(ips[len(ips)-1], ip)
+			ips = append(ips, ip)
 		}
 	}
 	return ips

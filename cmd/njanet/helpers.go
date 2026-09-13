@@ -67,6 +67,28 @@ func resolveMAC(ip string) string {
 	return ""
 }
 
+// guardSelfTarget menolak operasi yang akan mematikan konektivitas sendiri:
+// target = IP laptop ini atau IP gateway. Mengembalikan true jika pemanggil
+// harus batal (pesan sudah dicetak).
+func guardSelfTarget(candidates []string, ifaceName string) bool {
+	myIP := getMyIP(ifaceName)
+	gw := getGatewayIP()
+	for _, ip := range candidates {
+		if ip == "" {
+			continue
+		}
+		if ip == myIP {
+			fmt.Fprintf(os.Stderr, "Ditolak: %s adalah IP laptop ini.\n", ip)
+			return true
+		}
+		if ip == gw {
+			fmt.Fprintf(os.Stderr, "Ditolak: %s adalah gateway — memblokirnya mematikan seluruh jaringan.\n", ip)
+			return true
+		}
+	}
+	return false
+}
+
 func parseInt(s string) (int, error) {
 	return strconv.Atoi(s)
 }

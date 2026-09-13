@@ -96,6 +96,14 @@ func (c *Controller) ThrottleDevice(dev *db.Device, speedKbps int) error {
 	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
 	c.startARPSpoof(dev.IP)
 
+	// Catat IP lama SEBELUM getOrCreateRule menimpanya — filter tc terikat
+	// IP, jadi pindah IP (DHCP) harus membersihkan filter IP lama.
+	oldIP := ""
+	oldClass := 0
+	if r, ok := c.activeDevices[dev.MAC]; ok {
+		oldIP = r.IP
+		oldClass = r.ClassID
+	}
 	rule := c.getOrCreateRule(dev)
 	rule.SpeedLimit = speedKbps
 	classID := rule.ClassID
@@ -110,6 +118,13 @@ func (c *Controller) ThrottleDevice(dev *db.Device, speedKbps int) error {
 		burst = "4kbit"
 	}
 	classStr := fmt.Sprintf("1:%d", classID)
+
+	if oldIP != "" && oldIP != dev.IP && oldClass != 0 {
+		c.delThrottleFilters(oldIP, fmt.Sprintf("1:%d", oldClass))
+	}
+	// Hapus dulu filter yang mungkin sudah ada (re-throttle) supaya
+	// tidak menumpuk duplikat tiap panggilan.
+	c.delThrottleFilters(dev.IP, classStr)
 
 	// Create the class; if it already exists (e.g. re-throttle in the watch mode
 	// after an IP change), class add fails and class change updates the rate.
@@ -129,6 +144,11 @@ func (c *Controller) ThrottleDevice(dev *db.Device, speedKbps int) error {
 	return nil
 }
 
+func (c *Controller) delThrottleFilters(ip, classStr string) {
+	exec.Command("tc", "filter", "del", "dev", c.iface, "parent", htbHandle, "protocol", "ip", "prio", "1", "u32", "match", "ip", "dst", ip, "flowid", classStr).Run()
+	exec.Command("tc", "filter", "del", "dev", c.iface, "parent", htbHandle, "protocol", "ip", "prio", "1", "u32", "match", "ip", "src", ip, "flowid", classStr).Run()
+}
+
 func (c *Controller) removeThrottle(dev *db.Device) error {
 	rule, ok := c.activeDevices[dev.MAC]
 	if !ok || rule.ClassID == 0 {
@@ -137,8 +157,7 @@ func (c *Controller) removeThrottle(dev *db.Device) error {
 		return nil
 	}
 	classStr := fmt.Sprintf("1:%d", rule.ClassID)
-	exec.Command("tc", "filter", "del", "dev", c.iface, "parent", htbHandle, "protocol", "ip", "prio", "1", "u32", "match", "ip", "dst", dev.IP, "flowid", classStr).Run()
-	exec.Command("tc", "filter", "del", "dev", c.iface, "parent", htbHandle, "protocol", "ip", "prio", "1", "u32", "match", "ip", "src", dev.IP, "flowid", classStr).Run()
+	c.delThrottleFilters(dev.IP, classStr)
 	exec.Command("tc", "class", "del", "dev", c.iface, "classid", classStr).Run()
 	rule.SpeedLimit = 0
 	rule.ClassID = 0
