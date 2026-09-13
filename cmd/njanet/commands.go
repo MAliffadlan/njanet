@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -631,10 +632,9 @@ func cmdStats(ifaceName string) {
 	defer database.Close()
 
 	devices, _ := database.GetAllDevices()
-	online := 0
-	blocked := 0
-	var totalIn, totalOut int64
-
+	online, blocked, throttled := 0, 0, 0
+	vendors := make(map[string]int)
+	types := make(map[string]int)
 	for _, d := range devices {
 		if d.Online {
 			online++
@@ -642,17 +642,67 @@ func cmdStats(ifaceName string) {
 		if d.Blocked {
 			blocked++
 		}
-		totalIn += d.TrafficIn
-		totalOut += d.TrafficOut
+		if d.SpeedLimit > 0 {
+			throttled++
+		}
+		v := d.Vendor
+		if v == "" {
+			v = "(unknown)"
+		}
+		vendors[v]++
+		dt := d.DeviceType
+		if dt == "" {
+			dt = "unknown"
+		}
+		types[dt]++
 	}
+
+	protected, _ := database.GetProtectedMACs()
+	schedules, _ := database.GetSchedules()
+	watch, _ := database.GetWatchlist()
 
 	fmt.Printf("📊 NjaNet Statistics\n")
 	fmt.Println(strings.Repeat("-", 40))
-	fmt.Printf("Total devices:   %d\n", len(devices))
-	fmt.Printf("Online devices:  %d\n", online)
-	fmt.Printf("Blocked devices: %d\n", blocked)
-	fmt.Printf("Traffic in:      %s\n", formatBytes(totalIn))
-	fmt.Printf("Traffic out:     %s\n", formatBytes(totalOut))
+	fmt.Printf("Perangkat:      %d total, %d online\n", len(devices), online)
+	fmt.Printf("Dibatasi:       %d throttled, %d blocked\n", throttled, blocked)
+	fmt.Printf("Protected:      %d\n", len(protected))
+	fmt.Printf("Jadwal:         %d (watch: %d)\n", len(schedules), len(watch))
+	if total, on, at, ok := database.GetLatestScan(); ok && !at.IsZero() {
+		fmt.Printf("Scan terakhir:  %s (%d perangkat, %d online)\n",
+			at.Format("02 Jan 2006 15:04"), total, on)
+	} else {
+		fmt.Println("Scan terakhir:  belum pernah (jalankan: sudo njanet s)")
+	}
+
+	printTopCount("Vendor teratas", vendors, 5)
+	printTopCount("Tipe perangkat", types, 5)
+}
+
+func printTopCount(title string, counts map[string]int, n int) {
+	if len(counts) == 0 {
+		return
+	}
+	type entry struct {
+		name  string
+		count int
+	}
+	list := make([]entry, 0, len(counts))
+	for k, v := range counts {
+		list = append(list, entry{k, v})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].count != list[j].count {
+			return list[i].count > list[j].count
+		}
+		return list[i].name < list[j].name
+	})
+	fmt.Printf("\n%s:\n", title)
+	for i, e := range list {
+		if i >= n {
+			break
+		}
+		fmt.Printf("  %-15s %d\n", truncate(e.name, 15), e.count)
+	}
 }
 
 // --- Defend ---

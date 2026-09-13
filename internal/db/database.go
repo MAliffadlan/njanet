@@ -111,6 +111,16 @@ func (d *Database) migrate() error {
 	return err
 }
 
+// parseDBTime membaca timestamp SQLite. Driver go-sqlite3 mengembalikan
+// kolom DATETIME sebagai RFC3339 saat di-scan ke string, sementara baris
+// lama bisa tersimpan sebagai "2006-01-02 15:04:05" — coba keduanya.
+func parseDBTime(s string) (time.Time, error) {
+	if t, err := time.Parse("2006-01-02 15:04:05", s); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, s)
+}
+
 // --- Device CRUD ---
 
 func (d *Database) UpsertDevice(dev *Device) (int64, error) {
@@ -164,8 +174,8 @@ func (d *Database) GetAllDevices() ([]*Device, error) {
 		if err != nil {
 			return nil, err
 		}
-		dev.FirstSeen, _ = time.Parse("2006-01-02 15:04:05", firstSeen)
-		dev.LastSeen, _ = time.Parse("2006-01-02 15:04:05", lastSeen)
+		dev.FirstSeen, _ = parseDBTime(firstSeen)
+		dev.LastSeen, _ = parseDBTime(lastSeen)
 		devices = append(devices, dev)
 	}
 	return devices, nil
@@ -282,6 +292,19 @@ func (d *Database) DeactivateWatch(mac string) error {
 func (d *Database) LogScan(total, online int) error {
 	_, err := d.Exec("INSERT INTO scan_history (total_devices, online_devices) VALUES (?, ?)", total, online)
 	return err
+}
+
+// GetLatestScan returns the most recent scan record.
+// ok is false when no scan has ever been logged.
+func (d *Database) GetLatestScan() (total, online int, at time.Time, ok bool) {
+	var atStr string
+	err := d.QueryRow(`SELECT total_devices, online_devices, scanned_at
+		FROM scan_history ORDER BY id DESC LIMIT 1`).Scan(&total, &online, &atStr)
+	if err != nil {
+		return 0, 0, time.Time{}, false
+	}
+	at, _ = parseDBTime(atStr)
+	return total, online, at, true
 }
 
 // --- Schedules ---
