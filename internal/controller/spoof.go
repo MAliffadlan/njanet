@@ -18,14 +18,16 @@ import (
 )
 
 const (
-	purposeBlock    = "block"
-	purposeThrottle = "throttle"
-	spoofMarker     = "NJANET_SPOOF"
+	purposeManualBlock = "block"
+	purposeSchedBlock  = "sched-block"
+	purposeThrottle    = "throttle"
+	spoofMarker        = "NJANET_SPOOF"
 )
 
 type spoofState struct {
 	Iface     string    `json:"iface"`
 	Target    string    `json:"target"`
+	MAC       string    `json:"mac"`
 	Kind      string    `json:"kind"`
 	PIDs      []int     `json:"pids"`
 	Purposes  []string  `json:"purposes"`
@@ -162,6 +164,18 @@ func containsString(list []string, want string) bool {
 	return false
 }
 
+func blockStatesForMAC(states []spoofStateFile, iface, mac string) []spoofStateFile {
+	var out []spoofStateFile
+	for _, entry := range states {
+		st := entry.State
+		if st.Iface == iface && strings.EqualFold(st.MAC, mac) &&
+			(hasPurpose(st, purposeManualBlock) || hasPurpose(st, purposeSchedBlock)) {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
 func hasPurpose(st *spoofState, purpose string) bool {
 	for _, p := range st.Purposes {
 		if p == purpose {
@@ -251,12 +265,10 @@ func (c *Controller) killSpoofHandles(target string) error {
 	return errors.Join(errs...)
 }
 
-// cleanupStaleSpoofs is called while the CLI-wide lock is held, so any
-// throttle purpose found here belongs to a crashed session. Manual blocks are
-// persistent and have no owning process; they are kept.
-// staleThrottle reports that tc state may also be left over, so the caller can
-// remove NjaNet's qdisc.
-func (c *Controller) cleanupStaleSpoofs() (staleThrottle bool, err error) {
+// cleanupStaleSpoofs is called while the CLI-wide lock is held. Scheduler
+// purposes without a live daemon are stale; manual blocks are persistent.
+// staleThrottle reports that tc state may also be left over.
+func (c *Controller) cleanupStaleSpoofs(preserveScheduled bool) (staleThrottle bool, err error) {
 	if c.stateDir == "" {
 		return false, nil
 	}
@@ -267,22 +279,63 @@ func (c *Controller) cleanupStaleSpoofs() (staleThrottle bool, err error) {
 	var errs []error
 	for _, entry := range states {
 		st := entry.State
-		hasBlock := hasPurpose(st, purposeBlock)
-		if hasPurpose(st, purposeThrottle) {
+		hasManual := hasPurpose(st, purposeManualBlock)
+		hasSched := hasPurpose(st, purposeSchedBlock)
+		hasThrottle := hasPurpose(st, purposeThrottle)
+
+		if preserveScheduled && !hasThrottle {
+			// The scheduler validates its own persisted state after creation.
+			continue
+		}
+		if preserveScheduled && hasThrottle {
+			// Only stale throttle ownership is cleaned; sched/manual block
+			// state is left for the scheduler's startup reconciliation.
 			staleThrottle = true
 			removePurpose(st, purposeThrottle)
-			if hasBlock && spoofStateAlive(st) {
-				// A manual block shares the spoof; keep its processes but drop
-				// the stale throttle ownership.
+			if spoofStateAlive(st) && (hasManual || hasSched) {
 				if err := saveSpoofState(entry.Path, st); err != nil {
 					errs = append(errs, err)
 				}
 				continue
 			}
-		}
-		if hasBlock && spoofStateAlive(st) {
+			if err := killSpoofState(st); err != nil {
+				errs = append(errs, err)
+			}
+			if err := os.Remove(entry.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				errs = append(errs, err)
+			}
 			continue
 		}
+
+		if hasSched {
+			removePurpose(st, purposeSchedBlock)
+			if err := c.deleteChainRulesOwner(st.Target, ruleOwnerSched); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if hasThrottle {
+			staleThrottle = true
+			removePurpose(st, purposeThrottle)
+		}
+		if hasManual && spoofStateAlive(st) {
+			// Keep the manual block and its spoof, dropping only scheduler
+			// and throttle ownership.
+			if (hasSched || hasThrottle) && len(st.Purposes) > 0 {
+				if err := saveSpoofState(entry.Path, st); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			continue
+		}
+		if hasManual {
+			// Manual block with a dead spoof: drop the state file, leave its
+			// rules for an explicit unblock/reset.
+			if err := os.Remove(entry.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				errs = append(errs, err)
+			}
+			continue
+		}
+		// Scheduled/throttle-only leftovers are stale.
 		if err := killSpoofState(st); err != nil {
 			errs = append(errs, err)
 		}
@@ -293,27 +346,40 @@ func (c *Controller) cleanupStaleSpoofs() (staleThrottle bool, err error) {
 	return staleThrottle, errors.Join(errs...)
 }
 
-func (c *Controller) startSpoof(target, purpose string) error {
+func (c *Controller) startSpoof(target, purpose, mac string) error {
 	if err := c.ensureSpoofStateDir(); err != nil {
 		return err
 	}
 	if target == "" {
 		return fmt.Errorf("spoof target IP is empty")
 	}
+	mac = normalizeMAC(mac)
+	if mac == "" {
+		return fmt.Errorf("spoof target MAC is empty")
+	}
 	path := c.spoofStatePath(target)
 	st, err := loadSpoofState(path)
 	var preserved []string
 	switch {
 	case err == nil:
-		if st.Iface == c.iface && st.Target == target && spoofStateAlive(st) {
+		sameMAC := st.MAC == "" || strings.EqualFold(st.MAC, mac)
+		if st.Iface == c.iface && st.Target == target && sameMAC && spoofStateAlive(st) {
+			changed := false
+			if st.MAC == "" {
+				st.MAC = mac
+				changed = true
+			}
 			if addPurpose(st, purpose) {
+				changed = true
+			}
+			if changed {
 				if err := saveSpoofState(path, st); err != nil {
 					return err
 				}
 			}
 			return nil
 		}
-		if st.Iface == c.iface && st.Target == target {
+		if st.Iface == c.iface && st.Target == target && sameMAC {
 			preserved = append(preserved, st.Purposes...)
 		}
 		// Stale entry: kill whatever is still identifiable and restart cleanly.
@@ -338,6 +404,7 @@ func (c *Controller) startSpoof(target, purpose string) error {
 	st = &spoofState{
 		Iface:    c.iface,
 		Target:   target,
+		MAC:      mac,
 		Kind:     kind,
 		PIDs:     pids,
 		Purposes: purposes,
@@ -392,6 +459,42 @@ func (c *Controller) stopSpoof(target, purpose string) error {
 	}
 	c.restoreARP(target)
 	return errors.Join(errs...)
+}
+
+// UnblockMAC removes all block rules and spoof purposes recorded for a MAC,
+// regardless of which IP the device had when it was blocked.
+func (c *Controller) UnblockMAC(mac string) (int, error) {
+	if err := c.checkPrivileges(); err != nil {
+		return 0, err
+	}
+	mac = normalizeMAC(mac)
+	if mac == "" {
+		return 0, fmt.Errorf("invalid MAC address")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	states, err := loadAllSpoofStates(c.stateDir)
+	if err != nil {
+		return 0, err
+	}
+	var errs []error
+	removed := 0
+	for _, entry := range blockStatesForMAC(states, c.iface, mac) {
+		st := entry.State
+		if err := errors.Join(c.deleteChainRules(st.Target), c.removeLegacyForwardDropRules(st.Target)); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		manualErr := c.stopSpoof(st.Target, purposeManualBlock)
+		schedErr := c.stopSpoof(st.Target, purposeSchedBlock)
+		if err := errors.Join(manualErr, schedErr); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		removed++
+	}
+	return removed, errors.Join(errs...)
 }
 
 func (c *Controller) stopAllSpoofs() error {

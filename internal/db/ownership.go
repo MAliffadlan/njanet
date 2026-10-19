@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 type stateOwner struct {
@@ -50,67 +51,81 @@ func ownerForPath(dir string) *stateOwner {
 	return &stateOwner{uid: uid, gid: gid}
 }
 
+func openNoFollow(path string, flags int, mode uint32) (*os.File, error) {
+	fd, err := syscall.Open(path, flags|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, mode)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}
+
+func secureFile(f *os.File, owner *stateOwner, mode os.FileMode) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", f.Name())
+	}
+	if owner != nil {
+		if err := f.Chown(owner.uid, owner.gid); err != nil {
+			return fmt.Errorf("chown %s: %w", f.Name(), err)
+		}
+	}
+	if err := f.Chmod(mode); err != nil {
+		return fmt.Errorf("chmod %s: %w", f.Name(), err)
+	}
+	return nil
+}
+
 func ensureStateDir(dir string, owner *stateOwner) error {
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create db dir: %w", err)
 	}
-	info, err := os.Lstat(dir)
+	f, err := openNoFollow(dir, syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return fmt.Errorf("refusing symlinked state directory %s", dir)
+		}
+		return fmt.Errorf("open db dir: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("stat db dir: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("refusing symlinked state directory %s", dir)
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("state path %s is not a directory", dir)
 	}
 	if owner != nil {
-		if err := os.Chown(dir, owner.uid, owner.gid); err != nil {
+		if err := f.Chown(owner.uid, owner.gid); err != nil {
 			return fmt.Errorf("chown state dir %s: %w", dir, err)
 		}
-		if err := os.Chmod(dir, 0700); err != nil {
+		if err := f.Chmod(0o700); err != nil {
 			return fmt.Errorf("chmod state dir %s: %w", dir, err)
 		}
 		return nil
 	}
 	// Best effort privacy for user-owned dirs; ignore EPERM for shared dirs.
-	if info.Mode().Perm()&0077 != 0 {
-		_ = os.Chmod(dir, 0700)
+	if info.Mode().Perm()&0o077 != 0 {
+		_ = f.Chmod(0o700)
 	}
 	return nil
 }
 
 func prepareDBFile(path string, owner *stateOwner) error {
-	if info, err := os.Lstat(path); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
+	f, err := openNoFollow(path, syscall.O_CREAT|syscall.O_RDWR, 0o600)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
 			return fmt.Errorf("refusing symlinked database %s", path)
 		}
-		if info.IsDir() {
-			return fmt.Errorf("database path %s is a directory", path)
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("stat database: %w", err)
-	}
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
 		if errors.Is(err, fs.ErrPermission) {
 			return fmt.Errorf("database %s is not writable (often created by an earlier sudo run); run once with sudo so NjaNet can repair ownership: %w", path, err)
 		}
 		return fmt.Errorf("open database: %w", err)
 	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close database: %w", err)
-	}
-	if owner != nil {
-		if err := os.Chown(path, owner.uid, owner.gid); err != nil {
-			return fmt.Errorf("chown database %s: %w", path, err)
-		}
-	}
-	if err := os.Chmod(path, 0600); err != nil {
-		return fmt.Errorf("chmod database %s: %w", path, err)
-	}
-	return nil
+	defer f.Close()
+	return secureFile(f, owner, 0o600)
 }
 
 // secureStateFiles fixes ownership and mode of the database and its SQLite
@@ -119,26 +134,24 @@ func prepareDBFile(path string, owner *stateOwner) error {
 func secureStateFiles(path string, owner *stateOwner) error {
 	var errs []error
 	for _, p := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
-		info, err := os.Lstat(p)
+		f, err := openNoFollow(p, syscall.O_RDONLY, 0)
 		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
 				continue
 			}
-			errs = append(errs, fmt.Errorf("stat %s: %w", p, err))
-			continue
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			errs = append(errs, fmt.Errorf("refusing symlinked state file %s", p))
-			continue
-		}
-		if owner != nil {
-			if err := os.Chown(p, owner.uid, owner.gid); err != nil {
-				errs = append(errs, fmt.Errorf("chown %s: %w", p, err))
+			if errors.Is(err, syscall.ELOOP) {
+				errs = append(errs, fmt.Errorf("refusing symlinked state file %s", p))
 				continue
 			}
+			errs = append(errs, fmt.Errorf("open %s: %w", p, err))
+			continue
 		}
-		if err := os.Chmod(p, 0600); err != nil {
-			errs = append(errs, fmt.Errorf("chmod %s: %w", p, err))
+		err = secureFile(f, owner, 0o600)
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)

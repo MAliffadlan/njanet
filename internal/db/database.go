@@ -384,6 +384,15 @@ func (d *Database) RemoveScheduleByMAC(mac string) (bool, error) {
 	return n > 0, nil
 }
 
+func (d *Database) RemoveSchedulesByIP(ip string) (bool, error) {
+	res, err := d.Exec("DELETE FROM schedules WHERE ip = ?", ip)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 func (d *Database) UpdateScheduleIP(mac, ip string) error {
 	_, err := d.Exec("UPDATE schedules SET ip = ? WHERE mac = ?", ip, mac)
 	return err

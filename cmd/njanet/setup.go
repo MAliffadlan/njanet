@@ -33,8 +33,21 @@ func initScanner(ifaceName string) *scanner.Scanner {
 	return sc
 }
 
+func newController(ifaceName string, preserveScheduled bool) *controller.Controller {
+	dir := mustRuntimeStateDir()
+	if err := migrateLegacyRuntimeState(filepath.Dir(dbPath), dir); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	return controller.New(ifaceName, getGatewayIP(), dir, preserveScheduled)
+}
+
 func initController(ifaceName string) *controller.Controller {
-	return controller.New(ifaceName, getGatewayIP(), filepath.Dir(dbPath))
+	return newController(ifaceName, false)
+}
+
+func initSchedulerController(ifaceName string, preserveScheduled bool) *controller.Controller {
+	return newController(ifaceName, preserveScheduled)
 }
 
 func autoDetectInterface() string {
@@ -89,15 +102,10 @@ func getLocalMAC(ifaceName string) string {
 }
 
 func resolveGatewayMAC() string {
-	data, err := os.ReadFile("/proc/net/arp")
-	if err != nil {
-		return ""
-	}
 	gatewayIP := getGatewayIP()
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 && fields[0] == gatewayIP && fields[3] != "(incomplete)" {
-			return strings.ToUpper(fields[3])
+	for _, e := range readARPEntries() {
+		if e.IP == gatewayIP {
+			return e.MAC
 		}
 	}
 	return ""

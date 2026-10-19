@@ -29,18 +29,19 @@ type DeviceRule struct {
 	MAC        string
 	IP         string
 	SpeedLimit int
-	Blocked    bool
 	ClassID    int
 }
 
 const (
-	htbHandle     = "1:"
-	defaultClass  = "1:10"
-	defaultRate   = "1000mbit"
-	firewallChain = "NJANET_FWD"
+	htbHandle       = "1:"
+	defaultClass    = "1:10"
+	defaultRate     = "1000mbit"
+	firewallChain   = "NJANET_FWD"
+	ruleOwnerManual = "njanet:manual"
+	ruleOwnerSched  = "njanet:sched"
 )
 
-func New(iface, gatewayIP, stateDir string) *Controller {
+func New(iface, gatewayIP, stateDir string, preserveScheduled bool) *Controller {
 	c := &Controller{
 		iface:         iface,
 		gatewayIP:     gatewayIP,
@@ -54,7 +55,7 @@ func New(iface, gatewayIP, stateDir string) *Controller {
 	if c.ready {
 		// The CLI-wide lock guarantees no other NjaNet mutation is running.
 		// Any non-block spoof state left here is from a crashed session.
-		if staleThrottle, _ := c.cleanupStaleSpoofs(); staleThrottle {
+		if staleThrottle, _ := c.cleanupStaleSpoofs(preserveScheduled); staleThrottle {
 			_ = c.removeQdisc()
 		}
 	}
@@ -117,8 +118,24 @@ func (c *Controller) runIPTables(args ...string) error {
 	return runCommand(c.iptablesPath, append([]string{"-w", "5"}, args...)...)
 }
 
-func (c *Controller) iptablesExists(args ...string) bool {
-	return exec.Command(c.iptablesPath, append([]string{"-w", "5"}, args...)...).Run() == nil
+func (c *Controller) iptablesRuleExists(args ...string) (bool, error) {
+	cmd := exec.Command(c.iptablesPath, append([]string{"-w", "5"}, args...)...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	msg := strings.TrimSpace(string(out))
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		// iptables uses exit 1 for "no such rule/chain"; other failures must
+		// not be mistaken for an absent rule (unblock would falsely succeed).
+		if msg == "" || strings.Contains(msg, "does a matching rule exist") ||
+			strings.Contains(msg, "No chain/target/match") || strings.Contains(msg, "No chain") {
+			return false, nil
+		}
+	}
+	return false, fmt.Errorf("iptables %s: %w: %s", strings.Join(args, " "), err, msg)
 }
 
 func (c *Controller) enableForwarding() error {
@@ -211,8 +228,11 @@ func (c *Controller) ThrottleDevice(dev *db.Device, speedKbps int) error {
 	if err := c.checkPrivileges(); err != nil {
 		return err
 	}
-	if dev == nil || dev.IP == "" || dev.MAC == "" {
-		return fmt.Errorf("device MAC/IP is empty")
+	if dev == nil || dev.IP == "" {
+		return fmt.Errorf("device IP is empty")
+	}
+	if speedKbps > 0 && dev.MAC == "" {
+		return fmt.Errorf("device MAC is empty")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -251,7 +271,7 @@ func (c *Controller) ThrottleDevice(dev *db.Device, speedKbps int) error {
 			return fmt.Errorf("stop spoof for old IP %s: %w", oldIP, err)
 		}
 	}
-	if err := c.startSpoof(dev.IP, purposeThrottle); err != nil {
+	if err := c.startSpoof(dev.IP, purposeThrottle, dev.MAC); err != nil {
 		return err
 	}
 	rollbackSpoof := func() {
@@ -350,6 +370,8 @@ func (c *Controller) removeThrottle(dev *db.Device) error {
 	return nil
 }
 
+// BlockDevice installs a manual block. Manual and scheduler rules carry
+// different iptables comments so one owner can never remove the other.
 func (c *Controller) BlockDevice(dev *db.Device) error {
 	if err := c.checkPrivileges(); err != nil {
 		return err
@@ -360,32 +382,57 @@ func (c *Controller) BlockDevice(dev *db.Device) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	rule := c.getOrCreateRule(dev)
-	if rule.Blocked {
-		return nil
-	}
 	if err := c.ensureChain(); err != nil {
 		return err
 	}
 	if err := c.enableForwarding(); err != nil {
 		return err
 	}
-	if err := c.startSpoof(dev.IP, purposeBlock); err != nil {
+	if err := c.startSpoof(dev.IP, purposeManualBlock, dev.MAC); err != nil {
 		return err
 	}
-	rollback := func() {
-		_ = c.stopSpoof(dev.IP, purposeBlock)
-		_ = c.deleteChainRules(dev.IP)
-	}
-	if err := c.ensureChainRule("-d", dev.IP); err != nil {
-		rollback()
+	if _, err := c.ensureChainRule("-d", dev.IP, ruleOwnerManual); err != nil {
+		_ = c.stopSpoof(dev.IP, purposeManualBlock)
 		return err
 	}
-	if err := c.ensureChainRule("-s", dev.IP); err != nil {
-		rollback()
+	if _, err := c.ensureChainRule("-s", dev.IP, ruleOwnerManual); err != nil {
+		_ = c.deleteChainRuleOwner("-d", dev.IP, ruleOwnerManual)
+		_ = c.stopSpoof(dev.IP, purposeManualBlock)
 		return err
 	}
-	rule.Blocked = true
+	return nil
+}
+
+// BlockDeviceScheduled installs the scheduler-owned drop rules. It is
+// idempotent and never touches manual rules for the same IP.
+func (c *Controller) BlockDeviceScheduled(dev *db.Device) error {
+	if err := c.checkPrivileges(); err != nil {
+		return err
+	}
+	if dev == nil || dev.IP == "" || dev.MAC == "" {
+		return fmt.Errorf("device MAC/IP is empty")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.ensureChain(); err != nil {
+		return err
+	}
+	if err := c.enableForwarding(); err != nil {
+		return err
+	}
+	if err := c.startSpoof(dev.IP, purposeSchedBlock, dev.MAC); err != nil {
+		return err
+	}
+	if _, err := c.ensureChainRule("-d", dev.IP, ruleOwnerSched); err != nil {
+		_ = c.stopSpoof(dev.IP, purposeSchedBlock)
+		return err
+	}
+	if _, err := c.ensureChainRule("-s", dev.IP, ruleOwnerSched); err != nil {
+		_ = c.deleteChainRuleOwner("-d", dev.IP, ruleOwnerSched)
+		_ = c.stopSpoof(dev.IP, purposeSchedBlock)
+		return err
+	}
 	return nil
 }
 
@@ -401,20 +448,55 @@ func (c *Controller) UnblockDevice(dev *db.Device) error {
 
 	ruleErr := c.deleteChainRules(dev.IP)
 	legacyErr := c.removeLegacyForwardDropRules(dev.IP)
-	spoofErr := c.stopSpoof(dev.IP, purposeBlock)
-	if rule, ok := c.activeDevices[dev.MAC]; ok {
-		rule.Blocked = false
+	manualErr := c.stopSpoof(dev.IP, purposeManualBlock)
+	schedErr := c.stopSpoof(dev.IP, purposeSchedBlock)
+	return errors.Join(ruleErr, legacyErr, manualErr, schedErr)
+}
+
+// ManualBlockRulesExist reports whether manual or legacy (no-comment) drop
+// rules exist for an IP. Used to preserve the DB blocked flag when a
+// scheduler-owned rule is removed.
+func (c *Controller) ManualBlockRulesExist(ip string) bool {
+	if c.iptablesPath == "" {
+		return false
 	}
-	return errors.Join(ruleErr, legacyErr, spoofErr)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.blockRulesExist(ip, ruleOwnerManual) || c.blockRulesExist(ip, "")
+}
+
+// UnblockScheduled removes only scheduler-owned rules and the scheduler spoof
+// purpose. A manual block at the same IP remains untouched.
+func (c *Controller) UnblockScheduled(dev *db.Device) error {
+	if err := c.checkPrivileges(); err != nil {
+		return err
+	}
+	if dev == nil || dev.IP == "" {
+		return fmt.Errorf("device IP is empty")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ruleErr := c.deleteChainRulesOwner(dev.IP, ruleOwnerSched)
+	spoofErr := c.stopSpoof(dev.IP, purposeSchedBlock)
+	return errors.Join(ruleErr, spoofErr)
 }
 
 func (c *Controller) ensureChain() error {
-	if !c.iptablesExists("-S", firewallChain) {
+	exists, err := c.iptablesRuleExists("-S", firewallChain)
+	if err != nil {
+		return err
+	}
+	if !exists {
 		if err := c.runIPTables("-N", firewallChain); err != nil {
 			return fmt.Errorf("create firewall chain: %w", err)
 		}
 	}
-	if !c.iptablesExists("-C", "FORWARD", "-j", firewallChain) {
+	exists, err = c.iptablesRuleExists("-C", "FORWARD", "-j", firewallChain)
+	if err != nil {
+		return err
+	}
+	if !exists {
 		if err := c.runIPTables("-I", "FORWARD", "1", "-j", firewallChain); err != nil {
 			return fmt.Errorf("attach firewall chain: %w", err)
 		}
@@ -422,24 +504,99 @@ func (c *Controller) ensureChain() error {
 	return nil
 }
 
-func (c *Controller) ensureChainRule(dir, ip string) error {
-	if c.iptablesExists("-C", firewallChain, dir, ip, "-j", "DROP") {
-		return nil
+func chainRuleArgs(action, dir, ip, owner string) []string {
+	args := []string{action, firewallChain, dir, ip}
+	if owner != "" {
+		args = append(args, "-m", "comment", "--comment", owner)
 	}
-	return c.runIPTables("-A", firewallChain, dir, ip, "-j", "DROP")
+	return append(args, "-j", "DROP")
 }
 
-func (c *Controller) deleteChainRules(ip string) error {
+func (c *Controller) ensureChainRule(dir, ip, owner string) (bool, error) {
+	exists, err := c.iptablesRuleExists(chainRuleArgs("-C", dir, ip, owner)...)
+	if err != nil {
+		return false, err
+	}
+	if exists {
+		return false, nil
+	}
+	if err := c.runIPTables(chainRuleArgs("-A", dir, ip, owner)...); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *Controller) deleteChainRuleOwner(dir, ip, owner string) error {
+	exists, err := c.iptablesRuleExists(chainRuleArgs("-C", dir, ip, owner)...)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	return c.runIPTables(chainRuleArgs("-D", dir, ip, owner)...)
+}
+
+func (c *Controller) blockRulesExist(ip, owner string) bool {
+	if c.iptablesPath == "" {
+		return false
+	}
+	dst, err := c.iptablesRuleExists(chainRuleArgs("-C", "-d", ip, owner)...)
+	if err != nil || !dst {
+		return false
+	}
+	src, err := c.iptablesRuleExists(chainRuleArgs("-C", "-s", ip, owner)...)
+	return err == nil && src
+}
+
+// ScheduledBlockActive reports whether the scheduler still owns a live block
+// for this MAC/IP. Manual rules are intentionally ignored.
+func (c *Controller) ScheduledBlockActive(mac, ip string) bool {
+	if c.stateDir == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.blockRulesExist(ip, ruleOwnerSched) {
+		return false
+	}
+	st, err := loadSpoofState(c.spoofStatePath(ip))
+	if err != nil {
+		return false
+	}
+	return st.Iface == c.iface && st.Target == ip &&
+		(st.MAC == "" || strings.EqualFold(st.MAC, mac)) &&
+		hasPurpose(st, purposeSchedBlock) && spoofStateAlive(st)
+}
+
+func (c *Controller) deleteChainRulesOwner(ip, owner string) error {
 	var errs []error
 	for _, dir := range []string{"-d", "-s"} {
 		for i := 0; i < 64; i++ {
-			if !c.iptablesExists("-C", firewallChain, dir, ip, "-j", "DROP") {
-				break
-			}
-			if err := c.runIPTables("-D", firewallChain, dir, ip, "-j", "DROP"); err != nil {
+			exists, err := c.iptablesRuleExists(chainRuleArgs("-C", dir, ip, owner)...)
+			if err != nil {
 				errs = append(errs, err)
 				break
 			}
+			if !exists {
+				break
+			}
+			if err := c.runIPTables(chainRuleArgs("-D", dir, ip, owner)...); err != nil {
+				errs = append(errs, err)
+				break
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// deleteChainRules removes manual, scheduler, and legacy (no-comment) rules
+// for an IP. Used only by explicit user unblock/reset paths.
+func (c *Controller) deleteChainRules(ip string) error {
+	var errs []error
+	for _, owner := range []string{ruleOwnerManual, ruleOwnerSched, ""} {
+		if err := c.deleteChainRulesOwner(ip, owner); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
@@ -460,7 +617,12 @@ func (c *Controller) removeLegacyForwardDropRules(ip string) error {
 	var errs []error
 	for _, dir := range []string{"-d", "-s"} {
 		for i := 0; i < 64; i++ {
-			if !c.iptablesExists("-C", "FORWARD", dir, ip, "-j", "DROP") {
+			exists, err := c.iptablesRuleExists("-C", "FORWARD", dir, ip, "-j", "DROP")
+			if err != nil {
+				errs = append(errs, err)
+				break
+			}
+			if !exists {
 				break
 			}
 			if err := c.runIPTables("-D", "FORWARD", dir, ip, "-j", "DROP"); err != nil {
@@ -491,7 +653,12 @@ func (c *Controller) Reset() error {
 func (c *Controller) cleanupFirewall() error {
 	var errs []error
 	for i := 0; i < 64; i++ {
-		if !c.iptablesExists("-C", "FORWARD", "-j", firewallChain) {
+		exists, err := c.iptablesRuleExists("-C", "FORWARD", "-j", firewallChain)
+		if err != nil {
+			errs = append(errs, err)
+			break
+		}
+		if !exists {
 			break
 		}
 		if err := c.runIPTables("-D", "FORWARD", "-j", firewallChain); err != nil {
@@ -499,7 +666,10 @@ func (c *Controller) cleanupFirewall() error {
 			break
 		}
 	}
-	if c.iptablesExists("-S", firewallChain) {
+	exists, err := c.iptablesRuleExists("-S", firewallChain)
+	if err != nil {
+		errs = append(errs, err)
+	} else if exists {
 		if err := c.runIPTables("-F", firewallChain); err != nil {
 			errs = append(errs, err)
 		}

@@ -55,6 +55,7 @@ KETERANGAN
   KBPS 0 = kembali normal. Contoh KBPS: 16 (hampir mati), 64 (WA saja),
   256 (browsing), 1024 (hampir normal). --watch mengikuti perangkat
   kalau IP-nya berubah (DHCP). Tekan Ctrl+C untuk berhenti & memulihkan.
+  Target harus terlihat di ARP untuk KBPS > 0; KBPS 0 boleh offline.
   IP laptop sendiri dan gateway otomatis ditolak.
 
 CONTOH
@@ -65,12 +66,12 @@ CONTOH
   njanet block (alias: b) — putuskan koneksi satu perangkat. (*)
 
 PENGGUNAAN
-  sudo njanet b IP
+  sudo njanet b IP|MAC
 
 KETERANGAN
   Perangkat tidak bisa akses internet/router sampai di-unblock.
-  Target bisa IP atau MAC. IP laptop sendiri dan gateway otomatis
-  ditolak.
+  Target harus terlihat di ARP saat perintah dijalankan. IP laptop
+  sendiri dan gateway otomatis ditolak.
 
 CONTOH
   sudo njanet b 192.168.1.8`,
@@ -78,10 +79,16 @@ CONTOH
   njanet unblock (alias: ub) — pulihkan koneksi perangkat. (*)
 
 PENGGUNAAN
-  sudo njanet ub IP
+  sudo njanet ub IP|MAC
+
+KETERANGAN
+  Unblock berdasarkan MAC membersihkan semua IP yang tercatat untuk
+  MAC tersebut. Unblock berdasarkan IP tetap bisa dipakai saat
+  perangkat offline.
 
 CONTOH
-  sudo njanet ub 192.168.1.8`,
+  sudo njanet ub 192.168.1.8
+  sudo njanet ub AA:BB:CC:DD:EE:FF`,
 	"hog": `NAMA
   njanet hog (alias: h) — batasi SEMUA perangkat kecuali laptop ini. (*)
 
@@ -172,6 +179,9 @@ KETERANGAN
   Window boleh lewat tengah malam (22:00-06:00). Di luar window
   perangkat dipulihkan otomatis. Daemon wajib jalan agar aturan
   ditegakkan; jadwal baru otomatis kepakai tanpa restart.
+  'sched remove <IP>' mencocokkan IP tersimpan; gunakan ID/MAC jika
+  IP perangkat sudah berubah. Setelah crash, jalankan ulang daemon
+  untuk merekonsiliasi state di /run/njanet, atau 'njanet reset'.
   Selama daemon jalan, perintah pengubah aturan lain (throttle,
   block, hog, reset) ditolak — hentikan daemon dulu.
 

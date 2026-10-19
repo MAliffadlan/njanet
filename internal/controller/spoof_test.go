@@ -12,6 +12,7 @@ func TestSpoofStateRoundTrip(t *testing.T) {
 	st := &spoofState{
 		Iface:    "eth0",
 		Target:   "192.168.1.5",
+		MAC:      "AA:BB:CC:DD:EE:FF",
 		Kind:     "arpspoof",
 		PIDs:     []int{999999, 999998},
 		Purposes: []string{purposeThrottle},
@@ -32,20 +33,20 @@ func TestSpoofStateRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if got.Target != st.Target || got.Kind != st.Kind || len(got.PIDs) != 2 {
+	if got.Target != st.Target || got.MAC != st.MAC || got.Kind != st.Kind || len(got.PIDs) != 2 {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 	if !hasPurpose(got, purposeThrottle) {
 		t.Fatal("throttle purpose lost")
 	}
-	if !addPurpose(got, purposeBlock) {
+	if !addPurpose(got, purposeManualBlock) {
 		t.Fatal("block purpose should be added")
 	}
-	if addPurpose(got, purposeBlock) {
+	if addPurpose(got, purposeManualBlock) {
 		t.Fatal("duplicate block purpose was added")
 	}
 	removePurpose(got, purposeThrottle)
-	if hasPurpose(got, purposeThrottle) || !hasPurpose(got, purposeBlock) {
+	if hasPurpose(got, purposeThrottle) || !hasPurpose(got, purposeManualBlock) {
 		t.Fatalf("purpose removal wrong: %+v", got.Purposes)
 	}
 }
@@ -55,6 +56,7 @@ func TestCleanupStaleSpoofs(t *testing.T) {
 	st := &spoofState{
 		Iface:    "eth0",
 		Target:   "192.168.1.5",
+		MAC:      "AA:BB:CC:DD:EE:FF",
 		Kind:     "arpspoof",
 		PIDs:     []int{999999, 999998}, // not running
 		Purposes: []string{purposeThrottle},
@@ -63,7 +65,7 @@ func TestCleanupStaleSpoofs(t *testing.T) {
 	if err := saveSpoofState(path, st); err != nil {
 		t.Fatal(err)
 	}
-	stale, err := c.cleanupStaleSpoofs()
+	stale, err := c.cleanupStaleSpoofs(false)
 	if err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
@@ -72,6 +74,83 @@ func TestCleanupStaleSpoofs(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("stale throttle state still exists: %v", err)
+	}
+}
+
+func TestBlockStatesForMAC(t *testing.T) {
+	states := []spoofStateFile{
+		{State: &spoofState{Iface: "eth0", MAC: "AA:BB:CC:DD:EE:FF", Target: "192.168.1.5", Purposes: []string{purposeManualBlock}}},
+		{State: &spoofState{Iface: "eth0", MAC: "AA:BB:CC:DD:EE:FF", Target: "192.168.1.6", Purposes: []string{purposeThrottle}}},
+		{State: &spoofState{Iface: "eth0", MAC: "aa:bb:cc:dd:ee:ff", Target: "192.168.1.7", Purposes: []string{purposeSchedBlock}}},
+		{State: &spoofState{Iface: "wlan0", MAC: "AA:BB:CC:DD:EE:FF", Target: "192.168.1.8", Purposes: []string{purposeManualBlock}}},
+	}
+	got := blockStatesForMAC(states, "eth0", "aa:bb:cc:dd:ee:ff")
+	if len(got) != 2 || got[0].State.Target != "192.168.1.5" || got[1].State.Target != "192.168.1.7" {
+		t.Fatalf("blockStatesForMAC = %+v", got)
+	}
+}
+
+func TestCleanupStaleSpoofsRemovesScheduledRules(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "iptables.log")
+	t.Setenv("IPT_LOG", logPath)
+	script := fakeTool(t, "iptables", `echo "$*" >> "$IPT_LOG"
+exit 0
+`)
+	c := &Controller{
+		iface:        "eth0",
+		stateDir:     t.TempDir(),
+		iptablesPath: script,
+	}
+	st := &spoofState{
+		Iface:    "eth0",
+		Target:   "192.168.1.5",
+		MAC:      "AA:BB:CC:DD:EE:FF",
+		Kind:     "arpspoof",
+		PIDs:     []int{999999, 999998},
+		Purposes: []string{purposeSchedBlock},
+	}
+	path := c.spoofStatePath(st.Target)
+	if err := saveSpoofState(path, st); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.cleanupStaleSpoofs(false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("scheduled state still exists: %v", err)
+	}
+	data, _ := os.ReadFile(logPath)
+	if !strings.Contains(string(data), "--comment "+ruleOwnerSched) {
+		t.Fatalf("scheduled rules were not cleaned:\n%s", data)
+	}
+}
+
+func TestCleanupPreservesScheduledState(t *testing.T) {
+	c := &Controller{
+		iface:    "eth0",
+		stateDir: t.TempDir(),
+	}
+	st := &spoofState{
+		Iface:    "eth0",
+		Target:   "192.168.1.5",
+		MAC:      "AA:BB:CC:DD:EE:FF",
+		Kind:     "arpspoof",
+		PIDs:     []int{999999, 999998},
+		Purposes: []string{purposeSchedBlock},
+	}
+	path := c.spoofStatePath(st.Target)
+	if err := saveSpoofState(path, st); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := c.cleanupStaleSpoofs(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale {
+		t.Fatal("scheduled block unexpectedly reported as stale throttle")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("scheduler state was removed during preserve startup: %v", err)
 	}
 }
 

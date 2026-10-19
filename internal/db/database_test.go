@@ -177,6 +177,56 @@ func TestRefusesSymlinkedDatabase(t *testing.T) {
 	}
 }
 
+func TestSecureStateFilesRefusesSymlinkSidecar(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "njanet.db")
+	if err := os.WriteFile(dbPath, []byte("db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, dbPath+"-wal"); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureStateFiles(dbPath, nil); err == nil {
+		t.Fatal("secureStateFiles accepted a symlinked sidecar")
+	}
+	data, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "keep" {
+		t.Fatalf("symlink target modified: %q", data)
+	}
+}
+
+func TestRemoveSchedulesByIP(t *testing.T) {
+	d := openTestDB(t)
+	if _, err := d.AddSchedule("AA:BB:CC:DD:EE:FF", "192.168.1.5", "block", 0, 0, 60, "*"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.AddSchedule("11:22:33:44:55:66", "192.168.1.6", "block", 0, 0, 60, "*"); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := d.RemoveSchedulesByIP("192.168.1.5")
+	if err != nil || !ok {
+		t.Fatalf("RemoveSchedulesByIP = (%v,%v), want (true,nil)", ok, err)
+	}
+	list, err := d.GetSchedules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].MAC != "11:22:33:44:55:66" {
+		t.Fatalf("wrong rows removed: %+v", list)
+	}
+	ok, err = d.RemoveSchedulesByIP("192.168.1.99")
+	if err != nil || ok {
+		t.Fatalf("missing IP = (%v,%v), want (false,nil)", ok, err)
+	}
+}
+
 func TestProtectedAndWatch(t *testing.T) {
 	d := openTestDB(t)
 

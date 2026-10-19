@@ -269,7 +269,7 @@ func cmdRename(ifaceName string) {
 
 func cmdBlock(ifaceName string) {
 	if len(os.Args) < 3 {
-		fmt.Println("Usage: njanet block <ip-address>")
+		fmt.Println("Usage: njanet block <ip-address|mac-address>")
 		return
 	}
 	target := os.Args[2]
@@ -288,17 +288,9 @@ func cmdBlock(ifaceName string) {
 	defer unlock()
 	ctrl := initController(ifaceName)
 
-	dev := findDevice(target, database)
-	if dev == nil {
-		resolvedMAC := resolveMAC(target)
-		dev = &db.Device{MAC: resolvedMAC, IP: target}
-		if resolvedMAC != "" {
-			database.UpsertDevice(dev)
-		}
-	}
-
-	if dev.MAC == "" {
-		fmt.Fprintf(os.Stderr, "Perangkat %s tidak dikenal (MAC tidak ketemu). Jalankan 'sudo njanet scan' dan pastikan perangkat online.\n", target)
+	dev, resolveErr := resolveLiveTarget(target, database, readARPEntries())
+	if resolveErr != nil {
+		fmt.Fprintf(os.Stderr, "Block ditolak: %v\n", resolveErr)
 		os.Exit(1)
 	}
 	if guardSelfTarget([]string{target, dev.IP}, ifaceName) {
@@ -309,13 +301,15 @@ func cmdBlock(ifaceName string) {
 		fmt.Fprintf(os.Stderr, "Block failed: %v\n", err)
 		os.Exit(1)
 	}
-	database.UpdateDeviceBlock(dev.MAC, true)
-	fmt.Printf("🔴 Blocked: %s (%s)\n", target, dev.MAC)
+	if err := database.UpdateDeviceBlock(dev.MAC, true); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: gagal update status DB: %v\n", err)
+	}
+	fmt.Printf("🔴 Blocked: %s (%s)\n", dev.IP, dev.MAC)
 }
 
 func cmdUnblock(ifaceName string) {
 	if len(os.Args) < 3 {
-		fmt.Println("Usage: njanet unblock <ip-address>")
+		fmt.Println("Usage: njanet unblock <ip-address|mac-address>")
 		return
 	}
 	target := os.Args[2]
@@ -334,26 +328,59 @@ func cmdUnblock(ifaceName string) {
 	defer unlock()
 	ctrl := initController(ifaceName)
 
-	dev := findDevice(target, database)
-	if dev == nil {
-		resolvedMAC := resolveMAC(target)
-		dev = &db.Device{MAC: resolvedMAC, IP: target}
-		if resolvedMAC != "" {
-			database.UpsertDevice(dev)
+	if isValidMAC(target) {
+		mac := strings.ToUpper(target)
+		removed, macErr := ctrl.UnblockMAC(mac)
+		if macErr != nil {
+			fmt.Fprintf(os.Stderr, "Unblock by MAC gagal: %v\n", macErr)
+			os.Exit(1)
 		}
+		if removed > 0 {
+			if err := database.UpdateDeviceBlock(mac, false); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: gagal update status DB: %v\n", err)
+			}
+			fmt.Printf("🟢 Unblocked: %s (%d IP tercatat)\n", mac, removed)
+			return
+		}
+		entries := readARPEntries()
+		dev := findVerifiedDeviceByMAC(database, mac, entries)
+		if dev == nil {
+			if live, err := resolveLiveTarget(target, database, entries); err == nil {
+				dev = live
+			}
+		}
+		if dev == nil || !isValidIP(dev.IP) {
+			fmt.Fprintf(os.Stderr, "MAC %s offline dan tidak punya IP tersimpan; gunakan IP atau 'sudo njanet reset'.\n", mac)
+			os.Exit(1)
+		}
+		if err := ctrl.UnblockDevice(dev); err != nil {
+			fmt.Fprintf(os.Stderr, "Unblock failed: %v\n", err)
+			os.Exit(1)
+		}
+		if err := database.UpdateDeviceBlock(mac, false); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: gagal update status DB: %v\n", err)
+		}
+		fmt.Printf("🟢 Unblocked: %s (%s)\n", dev.IP, mac)
+		return
 	}
 
-	if dev == nil || !isValidIP(dev.IP) {
-		fmt.Fprintf(os.Stderr, "Perangkat %s tidak dikenal atau IP-nya tidak tersedia. Jalankan 'sudo njanet scan' dulu.\n", target)
-		os.Exit(1)
+	var dev *db.Device
+	if live, err := resolveLiveTarget(target, database, readARPEntries()); err == nil {
+		dev = live
+	} else if stored := findDevice(target, database); stored != nil {
+		dev = stored
+		dev.IP = target
+	} else {
+		dev = &db.Device{IP: target}
 	}
-
 	if err := ctrl.UnblockDevice(dev); err != nil {
 		fmt.Fprintf(os.Stderr, "Unblock failed: %v\n", err)
 		os.Exit(1)
 	}
 	if dev.MAC != "" {
-		database.UpdateDeviceBlock(dev.MAC, false)
+		if err := database.UpdateDeviceBlock(dev.MAC, false); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: gagal update status DB: %v\n", err)
+		}
 		fmt.Printf("🟢 Unblocked: %s (%s)\n", dev.IP, dev.MAC)
 	} else {
 		fmt.Printf("🟢 Unblocked: %s\n", dev.IP)
@@ -364,8 +391,8 @@ func cmdUnblock(ifaceName string) {
 
 func cmdThrottle(ifaceName string) {
 	if len(os.Args) < 4 {
-		fmt.Println("Usage: njanet throttle <ip-address> <speed-kbps>")
-		fmt.Println("       njanet throttle <ip-address> 0  (unlimited)")
+		fmt.Println("Usage: njanet throttle <ip-address|mac-address> <speed-kbps>")
+		fmt.Println("       njanet throttle <ip-address|mac-address> 0  (unlimited)")
 		return
 	}
 	target := os.Args[2]
@@ -374,7 +401,7 @@ func cmdThrottle(ifaceName string) {
 		os.Exit(1)
 	}
 	speed, err := parseInt(os.Args[3])
-	if err != nil {
+	if err != nil || speed < 0 {
 		fmt.Fprintf(os.Stderr, "Invalid speed: %s\n", os.Args[3])
 		os.Exit(1)
 	}
@@ -389,20 +416,17 @@ func cmdThrottle(ifaceName string) {
 	defer unlock()
 	ctrl := initController(ifaceName)
 
-	dev := findDevice(target, database)
-	if dev == nil {
-		resolvedMAC := resolveMAC(target)
-		dev = &db.Device{MAC: resolvedMAC, IP: target}
-		if resolvedMAC != "" {
-			database.UpsertDevice(dev)
-		}
+	var dev *db.Device
+	if speed == 0 {
+		dev, err = resolveCleanupDevice(target, database)
+	} else {
+		dev, err = resolveLiveTarget(target, database, readARPEntries())
 	}
-
-	if dev.MAC == "" {
-		fmt.Fprintf(os.Stderr, "Perangkat %s tidak dikenal (MAC tidak ketemu). Jalankan 'sudo njanet scan' dan pastikan perangkat online.\n", target)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Throttle ditolak: %v\n", err)
 		os.Exit(1)
 	}
-	if guardSelfTarget([]string{target, dev.IP}, ifaceName) {
+	if speed > 0 && guardSelfTarget([]string{target, dev.IP}, ifaceName) {
 		os.Exit(1)
 	}
 
@@ -418,7 +442,11 @@ func cmdThrottle(ifaceName string) {
 			fmt.Fprintf(os.Stderr, "Failed to remove throttle: %v\n", err)
 			os.Exit(1)
 		}
-		database.UpdateDeviceSpeed(dev.MAC, 0)
+		if dev.MAC != "" {
+			if err := database.UpdateDeviceSpeed(dev.MAC, 0); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: gagal update status DB: %v\n", err)
+			}
+		}
 		fmt.Printf("⚡ Unlimited: %s\n", target)
 		return
 	}
@@ -830,6 +858,11 @@ func cmdReset(ifaceName string) {
 	}
 	if err := ctrl.Reset(); err != nil {
 		errs = append(errs, err)
+	}
+	if len(errs) == 0 {
+		if err := os.Remove(schedStatePath()); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("hapus state jadwal: %w", err))
+		}
 	}
 	if len(errs) > 0 {
 		fmt.Fprintf(os.Stderr, "Reset tidak selesai: %v\n", errors.Join(errs...))

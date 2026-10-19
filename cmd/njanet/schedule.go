@@ -1,15 +1,17 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/mectov/njanet/internal/controller"
 	"github.com/mectov/njanet/internal/db"
 )
 
@@ -111,6 +113,12 @@ func schedAdd(ifaceName string) {
 
 	// Tolak aturan yang tumpang tindih untuk MAC yang sama — dua aturan
 	// aktif bersamaan untuk satu perangkat akan saling menimpa tiap tick.
+	unlockSched, lockErr := acquireScheduleLock()
+	if lockErr != nil {
+		fmt.Fprintf(os.Stderr, "Gagal lock jadwal: %v\n", lockErr)
+		os.Exit(1)
+	}
+	defer unlockSched()
 	existing, _ := database.GetSchedules()
 	for _, e := range existing {
 		if e.MAC == mac && daysIntersect(e.Days, days) &&
@@ -179,6 +187,12 @@ func schedRemove() {
 
 	database := initDB()
 	defer database.Close()
+	unlockSched, lockErr := acquireScheduleLock()
+	if lockErr != nil {
+		fmt.Fprintf(os.Stderr, "Gagal lock jadwal: %v\n", lockErr)
+		os.Exit(1)
+	}
+	defer unlockSched()
 
 	if id, err := strconv.ParseInt(arg, 10, 64); err == nil {
 		if ok, err := database.RemoveScheduleByID(id); err != nil {
@@ -192,32 +206,34 @@ func schedRemove() {
 		return
 	}
 
-	mac := ""
-	if isValidMAC(arg) {
-		mac = strings.ToUpper(arg)
-	} else if isValidIP(arg) {
-		// Prefer the live ARP entry; the DB may still map the IP to an old MAC.
-		mac = resolveMAC(arg)
-		if mac == "" {
-			if m, err := database.FindMACByIP(arg); err == nil {
-				mac = m
-			}
+	if isValidIP(arg) {
+		// Match the stored schedule IP exactly. Resolving the IP to its
+		// current owner would delete the wrong device's schedules after DHCP
+		// reassignment.
+		ok, err := database.RemoveSchedulesByIP(arg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Gagal hapus jadwal: %v\n", err)
+			os.Exit(1)
 		}
-	} else {
+		if ok {
+			fmt.Printf("✅ Jadwal dengan IP %s dihapus\n", arg)
+		} else {
+			fmt.Printf("Tidak ada jadwal dengan IP %s.\n", arg)
+		}
+		return
+	}
+	if !isValidMAC(arg) {
 		fmt.Fprintf(os.Stderr, "Argumen tidak valid: %s (pakai id, IP, atau MAC)\n", arg)
 		os.Exit(1)
 	}
-	if mac == "" {
-		fmt.Printf("Tidak ada jadwal untuk %s.\n", arg)
-		return
-	}
+	mac := strings.ToUpper(arg)
 	if ok, err := database.RemoveScheduleByMAC(mac); err != nil {
 		fmt.Fprintf(os.Stderr, "Gagal hapus jadwal: %v\n", err)
 		os.Exit(1)
 	} else if ok {
 		fmt.Printf("✅ Jadwal untuk %s dihapus\n", mac)
 	} else {
-		fmt.Printf("Tidak ada jadwal untuk %s.\n", mac)
+		fmt.Printf("Tidak ada jadwal untuk %s.\n", arg)
 	}
 }
 
@@ -285,6 +301,249 @@ type appliedSched struct {
 	speed  int
 	ip     string
 	mac    string
+	id     int64
+}
+
+type desiredSched struct {
+	mac    string
+	ip     string
+	action string
+	speed  int
+	id     int64
+}
+
+type scheduleController interface {
+	BlockDeviceScheduled(*db.Device) error
+	ThrottleDevice(*db.Device, int) error
+	UnblockScheduled(*db.Device) error
+	ScheduledBlockActive(mac, ip string) bool
+	ManualBlockRulesExist(ip string) bool
+}
+
+type storedApplied struct {
+	Action     string `json:"action"`
+	Speed      int    `json:"speed"`
+	IP         string `json:"ip"`
+	ScheduleID int64  `json:"schedule_id"`
+}
+
+func selectDesired(candidates []desiredSched) (map[string]desiredSched, map[string][]int64) {
+	selected := make(map[string]desiredSched, len(candidates))
+	ids := make(map[string][]int64)
+	for _, d := range candidates {
+		ids[d.mac] = append(ids[d.mac], d.id)
+		if cur, ok := selected[d.mac]; !ok || d.id > cur.id {
+			selected[d.mac] = d
+		}
+	}
+	overlaps := make(map[string][]int64)
+	for mac, list := range ids {
+		if len(list) < 2 {
+			continue
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i] < list[j] })
+		overlaps[mac] = list
+	}
+	return selected, overlaps
+}
+
+// planSchedule compares desired state per MAC with what this daemon owns.
+// Reverts always run before applies, so removing and re-adding a schedule (or
+// adjacent windows changing IDs) cannot undo the still-desired rule.
+func planSchedule(applied map[string]appliedSched, desired map[string]desiredSched) (reverts []appliedSched, applies []desiredSched) {
+	for mac, cur := range applied {
+		d, want := desired[mac]
+		if !want {
+			reverts = append(reverts, cur)
+			continue
+		}
+		if cur.action == d.action && cur.speed == d.speed && cur.ip == d.ip {
+			continue
+		}
+		reverts = append(reverts, cur)
+		applies = append(applies, d)
+	}
+	for mac, d := range desired {
+		if _, ok := applied[mac]; !ok {
+			applies = append(applies, d)
+		}
+	}
+	sort.Slice(reverts, func(i, j int) bool { return reverts[i].mac < reverts[j].mac })
+	sort.Slice(applies, func(i, j int) bool {
+		if applies[i].mac != applies[j].mac {
+			return applies[i].mac < applies[j].mac
+		}
+		return applies[i].id < applies[j].id
+	})
+	return reverts, applies
+}
+
+func reconcileScheduleState(ctrl scheduleController, database *db.Database, applied map[string]appliedSched, desired map[string]desiredSched, persist func() error) {
+	for mac, cur := range applied {
+		if cur.action == "block" && !ctrl.ScheduledBlockActive(mac, cur.ip) {
+			if err := ctrl.UnblockScheduled(&db.Device{MAC: mac, IP: cur.ip}); err != nil {
+				fmt.Fprintf(os.Stderr, "[%s] block #%d tidak aktif dan gagal dibersihkan: %v\n", ts(), cur.id, err)
+				if _, want := desired[mac]; want {
+					// The device is still scheduled: let the idempotent apply
+					// path repair the rules instead of keeping a broken entry.
+					delete(applied, mac)
+					if perr := persist(); perr != nil {
+						fmt.Fprintf(os.Stderr, "[%s] state jadwal tidak bisa disimpan: %v\n", ts(), perr)
+					}
+				}
+				continue
+			}
+			if !ctrl.ManualBlockRulesExist(cur.ip) {
+				if err := database.UpdateDeviceBlock(mac, false); err != nil {
+					fmt.Fprintf(os.Stderr, "[%s] db error clear block %s: %v\n", ts(), mac, err)
+				}
+			}
+			delete(applied, mac)
+			if err := persist(); err != nil {
+				fmt.Fprintf(os.Stderr, "[%s] state jadwal tidak bisa disimpan: %v\n", ts(), err)
+			}
+			fmt.Printf("[%s] block #%d tidak aktif — menerapkan ulang\n", ts(), cur.id)
+			continue
+		}
+		if d, ok := desired[mac]; ok &&
+			cur.action == d.action && cur.speed == d.speed && cur.ip == d.ip && cur.id != d.id {
+			cur.id = d.id
+			applied[mac] = cur
+		}
+	}
+
+	if err := persist(); err != nil {
+		fmt.Fprintf(os.Stderr, "[%s] state jadwal tidak bisa disimpan; tick dilewati: %v\n", ts(), err)
+		return
+	}
+	reverts, applies := planSchedule(applied, desired)
+	for _, cur := range reverts {
+		delete(applied, cur.mac)
+		if err := revertSched(ctrl, database, cur); err != nil {
+			fmt.Fprintf(os.Stderr, "[%s] gagal mencabut aturan #%d (%s): %v\n", ts(), cur.id, cur.ip, err)
+			applied[cur.mac] = cur
+			continue
+		}
+		if err := persist(); err != nil {
+			fmt.Fprintf(os.Stderr, "[%s] gagal simpan state setelah mencabut #%d: %v\n", ts(), cur.id, err)
+			applied[cur.mac] = cur
+			continue
+		}
+		fmt.Printf("[%s] #%d aturan dicabut — %s (%s)\n", ts(), cur.id, cur.ip, cur.mac)
+	}
+	for _, d := range applies {
+		if _, ok := applied[d.mac]; ok {
+			// A previous revert failed; don't stack a new rule on top.
+			continue
+		}
+		// Write-ahead intent before touching the kernel: a crash from here on
+		// leaves a record that startup reconciliation can verify or clean.
+		applied[d.mac] = appliedSched{
+			action: d.action, speed: d.speed, ip: d.ip, mac: d.mac, id: d.id,
+		}
+		if err := persist(); err != nil {
+			delete(applied, d.mac)
+			fmt.Fprintf(os.Stderr, "[%s] state jadwal tidak bisa disimpan; jadwal #%d tidak diterapkan: %v\n", ts(), d.id, err)
+			continue
+		}
+		sc := &db.Schedule{ID: d.id, MAC: d.mac, IP: d.ip, Action: d.action, SpeedKbps: d.speed}
+		if err := applySched(ctrl, database, sc, d.ip); err != nil {
+			delete(applied, d.mac)
+			_ = persist()
+			fmt.Fprintf(os.Stderr, "[%s] ⚠️  Gagal terapkan jadwal #%d ke %s: %v (coba lagi tick berikut)\n",
+				ts(), d.id, d.ip, err)
+			continue
+		}
+		if err := persist(); err != nil {
+			// Never leave a kernel rule this process cannot track.
+			delete(applied, d.mac)
+			rev := appliedSched{action: d.action, speed: d.speed, ip: d.ip, mac: d.mac, id: d.id}
+			_ = revertSched(ctrl, database, rev)
+			fmt.Fprintf(os.Stderr, "[%s] gagal simpan state setelah menerapkan #%d; aturan dikembalikan: %v\n", ts(), d.id, err)
+			continue
+		}
+		fmt.Printf("[%s] #%d %s → %s (%s)\n", ts(), d.id, describeSched(sc), d.ip, d.mac)
+	}
+}
+
+func saveAppliedState(path string, applied map[string]appliedSched) error {
+	stored := make(map[string]storedApplied)
+	for mac, cur := range applied {
+		stored[mac] = storedApplied{
+			Action:     cur.action,
+			Speed:      cur.speed,
+			IP:         cur.ip,
+			ScheduleID: cur.id,
+		}
+	}
+	if len(stored) == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	data, err := json.Marshal(stored)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".sched-state-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func schedStatePath() string {
+	return filepath.Join(mustRuntimeStateDir(), "sched-state.json")
+}
+
+func loadAppliedState(path string) map[string]appliedSched {
+	out := make(map[string]appliedSched)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "[%s] gagal baca state jadwal: %v\n", ts(), err)
+		}
+		return out
+	}
+	var stored map[string]storedApplied
+	if err := json.Unmarshal(data, &stored); err != nil {
+		fmt.Fprintf(os.Stderr, "[%s] state jadwal korup: %v\n", ts(), err)
+		return out
+	}
+	for mac, cur := range stored {
+		if cur.IP == "" || (cur.Action != "block" && cur.Action != "throttle") {
+			continue
+		}
+		out[mac] = appliedSched{
+			action: cur.Action,
+			speed:  cur.Speed,
+			ip:     cur.IP,
+			mac:    mac,
+			id:     cur.ScheduleID,
+		}
+	}
+	return out
 }
 
 func cmdSchedRun(ifaceName string) {
@@ -310,7 +569,9 @@ func cmdSchedRun(ifaceName string) {
 	}
 	defer unlock()
 
-	ctrl := initController(ifaceName)
+	statePath := schedStatePath()
+	applied := loadAppliedState(statePath)
+	ctrl := initSchedulerController(ifaceName, len(applied) > 0)
 	if !ctrl.IsReady() {
 		fmt.Fprintln(os.Stderr, "❌ Root required: jalankan dengan sudo (butuh tc + iptables)")
 		os.Exit(1)
@@ -325,9 +586,40 @@ func cmdSchedRun(ifaceName string) {
 	fmt.Println("   Jadwal baru/revisi otomatis kepakai tanpa restart daemon.")
 	fmt.Println()
 
-	applied := make(map[int64]appliedSched)
+	staleThrottleMACs := make(map[string]bool)
+	for mac, cur := range applied {
+		if cur.action == "block" {
+			if !ctrl.ScheduledBlockActive(mac, cur.ip) {
+				// The scheduler-owned rule or spoof is gone (manual unblock,
+				// crashed spoof, external cleanup); remove only scheduler
+				// ownership and let the first tick reapply if still wanted.
+				if err := ctrl.UnblockScheduled(&db.Device{MAC: mac, IP: cur.ip}); err != nil {
+					fmt.Fprintf(os.Stderr, "Gagal membersihkan block lama %s: %v\n", cur.ip, err)
+					continue
+				}
+				if !ctrl.ManualBlockRulesExist(cur.ip) {
+					if err := database.UpdateDeviceBlock(mac, false); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: gagal update status DB: %v\n", err)
+					}
+				}
+				delete(applied, mac)
+			}
+			continue
+		}
+		// Controller.New already removed stale throttle qdisc/spoof state, so
+		// a persisted throttle must be reapplied from scratch.
+		staleThrottleMACs[mac] = true
+		delete(applied, mac)
+	}
+	if err := saveAppliedState(statePath, applied); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: gagal simpan state awal: %v\n", err)
+	}
+	persist := func() error {
+		return saveAppliedState(statePath, applied)
+	}
 	unknown := make(map[string]bool)
 	selfWarned := make(map[string]bool)
+	overlapWarned := make(map[string]string)
 
 	tick := func() {
 		now := time.Now()
@@ -338,51 +630,21 @@ func cmdSchedRun(ifaceName string) {
 			fmt.Fprintf(os.Stderr, "[%s] db error: %v\n", ts(), err)
 			return
 		}
-		present := make(map[int64]bool, len(schedules))
+
+		candidates := make([]desiredSched, 0, len(schedules))
 		for _, sc := range schedules {
-			present[sc.ID] = true
 			want := dayMatches(sc.Days, now) && inWindow(sc.StartMin, sc.EndMin, nowMin)
 
 			resolved := resolveIPByMAC(sc.MAC)
-			ip := resolved
 			if resolved != "" && resolved != sc.IP {
 				if err := database.UpdateScheduleIP(sc.MAC, resolved); err != nil {
 					fmt.Fprintf(os.Stderr, "[%s] db error update IP #%d: %v\n", ts(), sc.ID, err)
 				}
 			}
-
-			cur, ok := applied[sc.ID]
-
-			// Target ternyata IP sendiri/gateway (mis. ganti jaringan):
-			// jangan pernah terapkan, bersihkan bila sempat teraplikasi.
-			if ip != "" && (ip == myIP || ip == gwIP) {
-				if ok {
-					if err := revertSched(ctrl, database, cur); err != nil {
-						fmt.Fprintf(os.Stderr, "[%s] gagal mencabut jadwal #%d: %v\n", ts(), sc.ID, err)
-						continue
-					}
-					delete(applied, sc.ID)
-				}
-				if !selfWarned[sc.MAC] {
-					fmt.Printf("[%s] ⏭️  Jadwal #%d menunjuk %s (perangkat sendiri/gateway) — dilewati\n",
-						ts(), sc.ID, ip)
-					selfWarned[sc.MAC] = true
-				}
+			if !want {
 				continue
 			}
-			delete(selfWarned, sc.MAC)
-
-			if want && ip == "" {
-				// Perangkat hilang dari jaringan — bersihkan aturan basi.
-				// Jangan pernah memakai sc.IP: IP itu bisa sudah dipakai
-				// perangkat lain setelah DHCP lease berakhir.
-				if ok {
-					if err := revertSched(ctrl, database, cur); err != nil {
-						fmt.Fprintf(os.Stderr, "[%s] gagal mencabut aturan basi #%d: %v\n", ts(), sc.ID, err)
-						continue
-					}
-					delete(applied, sc.ID)
-				}
+			if resolved == "" {
 				if !unknown[sc.MAC] {
 					fmt.Printf("[%s] ⏳ %s belum terlihat di jaringan — menunggu...\n", ts(), sc.MAC)
 					unknown[sc.MAC] = true
@@ -390,49 +652,44 @@ func cmdSchedRun(ifaceName string) {
 				continue
 			}
 			delete(unknown, sc.MAC)
-
-			if want {
-				if !ok || cur.action != sc.Action || cur.speed != sc.SpeedKbps || cur.ip != ip {
-					if ok {
-						if err := revertSched(ctrl, database, cur); err != nil {
-							fmt.Fprintf(os.Stderr, "[%s] gagal mencabut aturan lama #%d: %v\n", ts(), sc.ID, err)
-							continue
-						}
-						delete(applied, sc.ID)
-					}
-					if err := applySched(ctrl, database, sc, ip); err != nil {
-						fmt.Fprintf(os.Stderr, "[%s] ⚠️  Gagal terapkan jadwal #%d ke %s: %v (coba lagi tick berikut)\n",
-							ts(), sc.ID, ip, err)
-						continue
-					}
-					applied[sc.ID] = appliedSched{action: sc.Action, speed: sc.SpeedKbps, ip: ip, mac: sc.MAC}
-					fmt.Printf("[%s] #%d %s → %s (%s)\n", ts(), sc.ID, describeSched(sc), ip, sc.MAC)
+			if resolved == myIP || resolved == gwIP {
+				if !selfWarned[sc.MAC] {
+					fmt.Printf("[%s] ⏭️  Jadwal #%d menunjuk %s (perangkat sendiri/gateway) — dilewati\n",
+						ts(), sc.ID, resolved)
+					selfWarned[sc.MAC] = true
 				}
 				continue
 			}
+			delete(selfWarned, sc.MAC)
+			candidates = append(candidates, desiredSched{
+				mac: sc.MAC, ip: resolved, action: sc.Action, speed: sc.SpeedKbps, id: sc.ID,
+			})
+		}
 
-			if ok {
-				if err := revertSched(ctrl, database, cur); err != nil {
-					fmt.Fprintf(os.Stderr, "[%s] gagal memulihkan jadwal #%d: %v\n", ts(), sc.ID, err)
-					continue
-				}
-				delete(applied, sc.ID)
-				fmt.Printf("[%s] #%d window selesai — %s (%s) dipulihkan\n", ts(), sc.ID, cur.ip, cur.mac)
+		desired, overlaps := selectDesired(candidates)
+		for mac, ids := range overlaps {
+			key := fmt.Sprint(ids)
+			if overlapWarned[mac] != key {
+				fmt.Printf("[%s] ⚠️  Beberapa jadwal aktif untuk %s: %v — memakai #%d\n",
+					ts(), mac, ids, desired[mac].id)
+				overlapWarned[mac] = key
+			}
+		}
+		for mac := range overlapWarned {
+			if _, ok := overlaps[mac]; !ok {
+				delete(overlapWarned, mac)
 			}
 		}
 
-		// Jadwal yang dihapus saat daemon berjalan tidak akan dikunjungi lagi
-		// oleh loop di atas; cabut aturannya di sini.
-		for id, cur := range applied {
-			if present[id] {
-				continue
+		reconcileScheduleState(ctrl, database, applied, desired, persist)
+
+		for mac := range staleThrottleMACs {
+			if _, want := desired[mac]; !want {
+				if err := database.UpdateDeviceSpeed(mac, 0); err != nil {
+					fmt.Fprintf(os.Stderr, "[%s] db error clear speed %s: %v\n", ts(), mac, err)
+				}
 			}
-			if err := revertSched(ctrl, database, cur); err != nil {
-				fmt.Fprintf(os.Stderr, "[%s] gagal mencabut jadwal #%d yang dihapus: %v\n", ts(), id, err)
-				continue
-			}
-			delete(applied, id)
-			fmt.Printf("[%s] Jadwal #%d dihapus — %s (%s) dipulihkan\n", ts(), id, cur.ip, cur.mac)
+			delete(staleThrottleMACs, mac)
 		}
 	}
 
@@ -449,10 +706,15 @@ func cmdSchedRun(ifaceName string) {
 			tick()
 		case <-sig:
 			fmt.Println("\n🔄 Memulihkan semua perangkat terjadwal...")
-			for id, cur := range applied {
+			for mac, cur := range applied {
 				if err := revertSched(ctrl, database, cur); err != nil {
-					fmt.Fprintf(os.Stderr, "Gagal memulihkan jadwal #%d (%s): %v\n", id, cur.ip, err)
+					fmt.Fprintf(os.Stderr, "Gagal memulihkan jadwal #%d (%s): %v\n", cur.id, cur.ip, err)
+					continue
 				}
+				delete(applied, mac)
+			}
+			if err := saveAppliedState(statePath, applied); err != nil {
+				fmt.Fprintf(os.Stderr, "Gagal simpan state jadwal: %v\n", err)
 			}
 			fmt.Println("✅ Scheduler berhenti")
 			return
@@ -460,32 +722,47 @@ func cmdSchedRun(ifaceName string) {
 	}
 }
 
-func applySched(ctrl *controller.Controller, database *db.Database, sc *db.Schedule, ip string) error {
+func applySched(ctrl scheduleController, database *db.Database, sc *db.Schedule, ip string) error {
 	dev := &db.Device{MAC: sc.MAC, IP: ip}
 	if sc.Action == "block" {
-		if err := ctrl.BlockDevice(dev); err != nil {
+		if err := ctrl.BlockDeviceScheduled(dev); err != nil {
 			return err
 		}
-		return database.UpdateDeviceBlock(sc.MAC, true)
+		if err := database.UpdateDeviceBlock(sc.MAC, true); err != nil {
+			fmt.Fprintf(os.Stderr, "[%s] db error update block #%d: %v\n", ts(), sc.ID, err)
+		}
+		return nil
 	}
 	if err := ctrl.ThrottleDevice(dev, sc.SpeedKbps); err != nil {
 		return err
 	}
-	return database.UpdateDeviceSpeed(sc.MAC, sc.SpeedKbps)
+	if err := database.UpdateDeviceSpeed(sc.MAC, sc.SpeedKbps); err != nil {
+		fmt.Fprintf(os.Stderr, "[%s] db error update speed #%d: %v\n", ts(), sc.ID, err)
+	}
+	return nil
 }
 
-func revertSched(ctrl *controller.Controller, database *db.Database, cur appliedSched) error {
+func revertSched(ctrl scheduleController, database *db.Database, cur appliedSched) error {
 	dev := &db.Device{MAC: cur.mac, IP: cur.ip}
 	if cur.action == "block" {
-		if err := ctrl.UnblockDevice(dev); err != nil {
+		if err := ctrl.UnblockScheduled(dev); err != nil {
 			return err
 		}
-		return database.UpdateDeviceBlock(cur.mac, false)
+		if ctrl.ManualBlockRulesExist(cur.ip) {
+			return nil
+		}
+		if err := database.UpdateDeviceBlock(cur.mac, false); err != nil {
+			fmt.Fprintf(os.Stderr, "[%s] db error clear block %s: %v\n", ts(), cur.mac, err)
+		}
+		return nil
 	}
 	if err := ctrl.ThrottleDevice(dev, 0); err != nil {
 		return err
 	}
-	return database.UpdateDeviceSpeed(cur.mac, 0)
+	if err := database.UpdateDeviceSpeed(cur.mac, 0); err != nil {
+		fmt.Fprintf(os.Stderr, "[%s] db error clear speed %s: %v\n", ts(), cur.mac, err)
+	}
+	return nil
 }
 
 func describeSched(sc *db.Schedule) string {
@@ -651,15 +928,10 @@ func ts() string {
 
 // resolveIPByMAC finds the current IP for a MAC from the kernel ARP table.
 func resolveIPByMAC(mac string) string {
-	data, err := os.ReadFile("/proc/net/arp")
-	if err != nil {
-		return ""
-	}
 	mac = strings.ToUpper(mac)
-	for _, line := range strings.Split(string(data), "\n") {
-		f := strings.Fields(line)
-		if len(f) >= 4 && strings.ToUpper(f[3]) == mac {
-			return f[0]
+	for _, e := range readARPEntries() {
+		if strings.EqualFold(e.MAC, mac) {
+			return e.IP
 		}
 	}
 	return ""

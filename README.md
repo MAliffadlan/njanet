@@ -19,8 +19,13 @@
 Diperlukan:
 - Sistem operasi **Linux**
 - **Go 1.22+** (untuk build dari source)
+- **iproute2** (`tc`) dan **iptables** — untuk throttle/block
 - Tool **dsniff** (`sudo apt install dsniff`) — untuk ARP spoof
+- **python3** (fallback ARP spoof jika `arpspoof` tidak ada)
+- **net-tools** (`arp`) — untuk memulihkan cache ARP
 - Hak akses **root** (sudo) — untuk throttle, block, hog
+
+State runtime (lock, PID spoof, state scheduler) disimpan di `/run/njanet`; database perangkat disimpan di `~/.njanet`.
 
 ## **3. Fitur**
 
@@ -77,18 +82,18 @@ PINDAI & PANTAU
   rt, router                Pindai web interface router
 
 BATASI & BLOKIR (*)
-  t, throttle IP KBPS [-w]  Batasi kecepatan (KBPS 0 = normal lagi)
-  b, block IP               Putuskan koneksi perangkat
-  ub, unblock IP            Pulihkan koneksi perangkat
-  h, hog KBPS               Batasi SEMUA perangkat kecuali laptop ini
-  d, defend                 Jaga jaringan dari serangan ARP spoof
-  rs, reset                 Hapus semua aturan NjaNet
+  t, throttle IP|MAC KBPS [-w]  Batasi kecepatan (KBPS 0 = normal lagi)
+  b, block IP|MAC               Putuskan koneksi perangkat
+  ub, unblock IP|MAC            Pulihkan koneksi perangkat
+  h, hog KBPS                   Batasi SEMUA perangkat kecuali laptop ini
+  d, defend                     Jaga jaringan dari serangan ARP spoof
+  rs, reset                     Hapus semua aturan NjaNet
 
 JADWAL OTOMATIS
-  sched add IP AKSI JAM [hari]  Tambah jadwal (block | KBPS, JAM 22:00-06:00)
-  sched list                    Lihat semua jadwal
-  sched remove ID|IP            Hapus jadwal
-  sched run (*)                 Jalankan penjadwal (daemon, Ctrl+C = stop)
+  sched add IP|MAC AKSI JAM [hari]  Tambah jadwal (block | KBPS, JAM 22:00-06:00)
+  sched list                        Lihat semua jadwal
+  sched remove ID|IP|MAC            Hapus jadwal
+  sched run (*)                     Jalankan penjadwal (daemon, Ctrl+C = stop)
 
 LAINNYA
   p, protect ...            Kecualikan perangkat dari hog (add|remove|list)
@@ -111,6 +116,14 @@ sudo njanet t 192.168.1.8 64
 
 # Batasi + auto-track jika IP berubah
 sudo njanet t 192.168.1.8 64 --watch
+
+# Block/unblock memakai IP atau MAC; unblock MAC membersihkan semua IP
+# yang pernah tercatat untuk perangkat itu
+sudo njanet b AA:BB:CC:DD:EE:FF
+sudo njanet ub AA:BB:CC:DD:EE:FF
+
+# Kembalikan throttle tanpa harus menunggu Ctrl+C
+sudo njanet t 192.168.1.8 0
 
 # Hog semua perangkat kecuali Anda
 sudo njanet h 64
@@ -166,6 +179,16 @@ Throttle / Block:
 3. **tc / iptables** — Bandwidth dibatasi sesuai aturan
 4. **Ctrl+C** — Semua kembali normal
 
+### State dan ownership
+
+- Rule **manual** (block/throttle dari terminal) dan rule **jadwal** memiliki owner terpisah. Mencabut jadwal tidak akan meng-unblock block manual, dan sebaliknya.
+- Hanya ada satu proses pengubah aturan pada satu waktu. Saat `sched run` aktif, perintah `throttle`/`block`/`hog`/`reset` ditolak sampai daemon dihentikan.
+- Database perangkat: `~/.njanet/njanet.db`. State runtime (lock, PID spoof, state scheduler): `/run/njanet` dengan permission root.
+- `block`/`throttle` membutuhkan target yang terlihat di ARP saat perintah dijalankan. `unblock` dan `throttle ... 0` tetap bisa memakai IP tersimpan.
+- `sched remove <IP>` mencocokkan IP yang tersimpan di jadwal. Kalau IP perangkat sudah berubah, gunakan ID atau MAC.
+- Daemon menyimpan state jadwal sebelum menerapkan aturan. Setelah crash, jalankan ulang `sudo njanet sched run` agar state direkonsiliasi. Kalau daemon tidak akan dijalankan lagi, gunakan `sudo njanet reset`.
+- `reset` menghapus rule NjaNet, state scheduler, dan mengembalikan perangkat. State lama dari versi sebelumnya di `~/.njanet` dimigrasikan otomatis saat perintah root pertama.
+
 ## **7. Keterbatasan**
 
 | Situasi | Keterangan |
@@ -175,37 +198,63 @@ Throttle / Block:
 | VPN | Tidak berfungsi |
 | Laptop mati / suspend | Throttle ikut mati |
 | Perangkat restart | Tanpa `--watch`, aturan hilang |
+| Target tidak terlihat di ARP | Block/throttle ditolak; scan dulu atau targetkan saat online |
+| Daemon scheduler crash/mati | State ada di `/run/njanet`; jalankan ulang `sched run` untuk rekonsiliasi, atau `reset` |
+| IP perangkat berubah saat offline | Hapus jadwal lewat ID/MAC; IP lama tidak dipakai untuk enforcement |
 | Dua perintah pengubah aturan bersamaan | Ditolak; hentikan proses aktif dulu (Ctrl+C) |
 
 ## **8. Troubleshooting**
 
 ```bash
-# ARP spoof tidak berjalan
+# ARP spoof tidak berjalan (arpspoof tidak ada)
 sudo apt install dsniff -y
+# Fallback membutuhkan python3 jika arpspoof tidak tersedia
+python3 --version
 
 # Error "root required"
 Gunakan sudo: sudo njanet throttle ...
 
-# Error tc
+# Error tc / state nyangkut setelah crash
 sudo njanet reset
+sudo iptables -S NJANET_FWD
+sudo tc qdisc show dev <interface>
+pgrep -a arpspoof
+pgrep -af NJANET_SPOOF
 
-# ARP spoof nyangkut dari session sebelumnya
+# ARP spoof nyangkut dari session lama yang tidak punya state
 sudo pkill -9 arpspoof
 sudo njanet reset
+
+# sched remove <IP> tidak menemukan jadwal
+# IP perangkat mungkin sudah berubah; gunakan ID atau MAC:
+njanet sched list
+njanet sched remove <ID>
 ```
 
-## **9. Struktur Project**
+## **9. Testing**
+
+```bash
+go build ./...
+go vet ./...
+go test -race ./...
+```
+
+Test berjalan tanpa root dan memakai fake `iptables`/ARP. Pengujian `tc`, `iptables`, dan ARP spoof nyata tetap memerlukan sudo dan interface jaringan sungguhan.
+
+## **10. Struktur Project**
 
 ```
 njanet/
-├── cmd/njanet/                   # CLI (main, commands, schedule, helpers, setup)
+├── cmd/njanet/                   # CLI (main, commands, schedule, lock, runtime, helpers, setup, help)
 ├── internal/
 │   ├── scanner/                 # Scanner (ARP, nmap, ping, defense)
-│   ├── controller/              # Block, throttle, ARP spoof
-│   └── db/                      # SQLite database
+│   ├── controller/              # Block, throttle, ARP spoof, ownership state
+│   └── db/                      # SQLite database + ownership/permissions
 ├── go.mod
 └── README.md
 ```
+
+State runtime: `/run/njanet`. Database: `~/.njanet/njanet.db`.
 
 ## **Disclaimer**
 
