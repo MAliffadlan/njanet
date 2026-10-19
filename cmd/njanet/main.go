@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 )
 
@@ -108,8 +109,13 @@ CONTOH
 func init() {
 	home := os.Getenv("HOME")
 	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-		// When running with sudo, use the original user's home
-		home = "/home/" + sudoUser
+		// When running with sudo, use the original user's home. Resolve it
+		// from the passwd entry so custom home directories also work.
+		if u, err := user.Lookup(sudoUser); err == nil && u.HomeDir != "" {
+			home = u.HomeDir
+		} else {
+			home = "/home/" + sudoUser
+		}
 	}
 	if home == "" {
 		var err error

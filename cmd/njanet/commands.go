@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -278,8 +279,14 @@ func cmdBlock(ifaceName string) {
 	}
 
 	database := initDB()
-	ctrl := initController(ifaceName)
 	defer database.Close()
+	unlock, err := acquireControllerLock()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer unlock()
+	ctrl := initController(ifaceName)
 
 	dev := findDevice(target, database)
 	if dev == nil {
@@ -318,8 +325,14 @@ func cmdUnblock(ifaceName string) {
 	}
 
 	database := initDB()
-	ctrl := initController(ifaceName)
 	defer database.Close()
+	unlock, err := acquireControllerLock()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer unlock()
+	ctrl := initController(ifaceName)
 
 	dev := findDevice(target, database)
 	if dev == nil {
@@ -330,12 +343,21 @@ func cmdUnblock(ifaceName string) {
 		}
 	}
 
+	if dev == nil || !isValidIP(dev.IP) {
+		fmt.Fprintf(os.Stderr, "Perangkat %s tidak dikenal atau IP-nya tidak tersedia. Jalankan 'sudo njanet scan' dulu.\n", target)
+		os.Exit(1)
+	}
+
 	if err := ctrl.UnblockDevice(dev); err != nil {
 		fmt.Fprintf(os.Stderr, "Unblock failed: %v\n", err)
 		os.Exit(1)
 	}
-	database.UpdateDeviceBlock(dev.MAC, false)
-	fmt.Printf("🟢 Unblocked: %s (%s)\n", target, dev.MAC)
+	if dev.MAC != "" {
+		database.UpdateDeviceBlock(dev.MAC, false)
+		fmt.Printf("🟢 Unblocked: %s (%s)\n", dev.IP, dev.MAC)
+	} else {
+		fmt.Printf("🟢 Unblocked: %s\n", dev.IP)
+	}
 }
 
 // --- Throttle ---
@@ -358,8 +380,14 @@ func cmdThrottle(ifaceName string) {
 	}
 
 	database := initDB()
-	ctrl := initController(ifaceName)
 	defer database.Close()
+	unlock, lockErr := acquireControllerLock()
+	if lockErr != nil {
+		fmt.Fprintln(os.Stderr, lockErr)
+		os.Exit(1)
+	}
+	defer unlock()
+	ctrl := initController(ifaceName)
 
 	dev := findDevice(target, database)
 	if dev == nil {
@@ -431,7 +459,10 @@ func cmdThrottle(ifaceName string) {
 						for _, d := range result.Devices {
 							if d.MAC == e.MAC && d.IP != e.IP {
 								fmt.Printf("\n🔍 %s changed IP: %s -> %s\n", e.MAC, e.IP, d.IP)
-								ctrl.ThrottleDevice(d, e.SpeedKbps)
+								if err := ctrl.ThrottleDevice(d, e.SpeedKbps); err != nil {
+									fmt.Fprintf(os.Stderr, "   ⚠️  Gagal re-apply throttle ke %s: %v\n", d.IP, err)
+									continue
+								}
 								database.UpdateWatchIP(e.MAC, d.IP)
 								fmt.Printf("   Re-applied throttle to %s\n", d.IP)
 							}
@@ -455,14 +486,24 @@ func cmdThrottle(ifaceName string) {
 	if watchMode && dev.MAC != "00:00:00:00:00:00" {
 		close(stopWatch)
 	}
-	ctrl.ThrottleDevice(dev, 0)
-	database.UpdateDeviceSpeed(dev.MAC, 0)
+	// Stop the watcher before restoring, otherwise it can re-apply a throttle
+	// after the cleanup and leave the device limited.
+	watchWG.Wait()
+	restored := true
+	if err := ctrl.ThrottleDevice(dev, 0); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to restore throttle: %v\n", err)
+		restored = false
+	} else {
+		database.UpdateDeviceSpeed(dev.MAC, 0)
+	}
 	if dev.MAC != "00:00:00:00:00:00" {
 		database.DeactivateWatch(dev.MAC)
 	}
-	// Wait for the watch goroutine to stop before the deferred DB close.
-	watchWG.Wait()
-	fmt.Println("✅ Network restored")
+	if restored {
+		fmt.Println("✅ Network restored")
+	} else {
+		fmt.Println("⚠️  Restore tidak selesai; jalankan 'sudo njanet reset'")
+	}
 }
 
 // --- Hog ---
@@ -478,6 +519,12 @@ func cmdHog(ifaceName string) {
 
 	database := initDB()
 	defer database.Close()
+	unlock, err := acquireControllerLock()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer unlock()
 
 	ctrl := initController(ifaceName)
 	if !ctrl.IsReady() {
@@ -544,6 +591,7 @@ func cmdHog(ifaceName string) {
 	<-sig
 
 	fmt.Println("\n🔄 Restoring all devices...")
+	failed := 0
 	for _, dev := range result.Devices {
 		if dev.IP == myIP || dev.IP == gatewayIP || dev.MAC == "00:00:00:00:00:00" {
 			continue
@@ -551,10 +599,18 @@ func cmdHog(ifaceName string) {
 		if protected[dev.MAC] {
 			continue
 		}
-		ctrl.ThrottleDevice(dev, 0)
+		if err := ctrl.ThrottleDevice(dev, 0); err != nil {
+			fmt.Fprintf(os.Stderr, "   ⚠️  Gagal memulihkan %s: %v\n", dev.IP, err)
+			failed++
+			continue
+		}
 		database.UpdateDeviceSpeed(dev.MAC, 0)
 	}
-	fmt.Println("✅ All devices restored")
+	if failed > 0 {
+		fmt.Printf("⚠️  %d perangkat gagal dipulihkan; jalankan 'sudo njanet reset'\n", failed)
+	} else {
+		fmt.Println("✅ All devices restored")
+	}
 }
 
 // --- Monitor ---
@@ -748,24 +804,49 @@ func cmdDefend(ifaceName string) {
 func cmdReset(ifaceName string) {
 	database := initDB()
 	defer database.Close()
+	unlock, err := acquireControllerLock()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer unlock()
 	ctrl := initController(ifaceName)
 
-	// Remove only the FORWARD DROP rules NjaNet created for each blocked device.
-	// Never flush whole iptables chains — that would wipe other firewall rules (ufw/firewalld).
-	devices, _ := database.GetAllDevices()
-	for _, dev := range devices {
-		if dev.Blocked {
-			ctrl.RemoveForwardDropRules(dev.IP)
-			database.UpdateDeviceBlock(dev.MAC, false)
-		}
-		if dev.SpeedLimit > 0 {
-			database.UpdateDeviceSpeed(dev.MAC, 0)
-		}
+	devices, err := database.GetAllDevices()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 
+	// Remove legacy FORWARD rules created by older versions (new rules live
+	// in the dedicated NJANET chain and are flushed by Reset).
+	var errs []error
+	for _, dev := range devices {
+		if dev.Blocked && dev.IP != "" {
+			if err := ctrl.RemoveForwardDropRules(dev.IP); err != nil {
+				errs = append(errs, fmt.Errorf("legacy rules for %s: %w", dev.IP, err))
+			}
+		}
+	}
 	if err := ctrl.Reset(); err != nil {
-		fmt.Fprintf(os.Stderr, "Reset failed: %v\n", err)
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		fmt.Fprintf(os.Stderr, "Reset tidak selesai: %v\n", errors.Join(errs...))
 		os.Exit(1)
+	}
+
+	for _, dev := range devices {
+		if dev.Blocked {
+			if err := database.UpdateDeviceBlock(dev.MAC, false); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: gagal update DB untuk %s: %v\n", dev.MAC, err)
+			}
+		}
+		if dev.SpeedLimit > 0 {
+			if err := database.UpdateDeviceSpeed(dev.MAC, 0); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: gagal update DB untuk %s: %v\n", dev.MAC, err)
+			}
+		}
 	}
 	fmt.Println("✅ All NjaNet rules reset")
 }

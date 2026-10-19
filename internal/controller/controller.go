@@ -1,9 +1,11 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -13,12 +15,14 @@ import (
 type Controller struct {
 	mu            sync.Mutex
 	iface         string
-	myIP          string
 	gatewayIP     string
+	stateDir      string
+	tcPath        string
+	iptablesPath  string
 	activeDevices map[string]*DeviceRule
-	ready         bool
-	noRootWarning bool
 	spoofProcs    map[string]*exec.Cmd
+	qdiscReady    bool
+	ready         bool
 }
 
 type DeviceRule struct {
@@ -30,204 +34,480 @@ type DeviceRule struct {
 }
 
 const (
-	htbHandle    = "1:"
-	defaultClass = "1:10"
-	defaultRate  = "1000mbit"
+	htbHandle     = "1:"
+	defaultClass  = "1:10"
+	defaultRate   = "1000mbit"
+	firewallChain = "NJANET_FWD"
 )
 
-func New(iface, myIP, gatewayIP string) *Controller {
-	// Clean up leftover arpspoof processes from crashed sessions
-	exec.Command("pkill", "-f", "arpspoof.*"+iface).Run()
-
+func New(iface, gatewayIP, stateDir string) *Controller {
 	c := &Controller{
 		iface:         iface,
-		myIP:          myIP,
 		gatewayIP:     gatewayIP,
+		stateDir:      stateDir,
+		tcPath:        findExecutable("tc"),
+		iptablesPath:  findExecutable("iptables"),
 		activeDevices: make(map[string]*DeviceRule),
 		spoofProcs:    make(map[string]*exec.Cmd),
 	}
-	tcPath, _ := exec.LookPath("tc")
-	iptablesPath, _ := exec.LookPath("iptables")
-	if tcPath != "" && iptablesPath != "" {
-		if err := c.initQdisc(); err == nil {
-			c.ready = true
+	c.ready = os.Geteuid() == 0 && c.iptablesPath != "" && c.stateDir != ""
+	if c.ready {
+		// The CLI-wide lock guarantees no other NjaNet mutation is running.
+		// Any non-block spoof state left here is from a crashed session.
+		if staleThrottle, _ := c.cleanupStaleSpoofs(); staleThrottle {
+			_ = c.removeQdisc()
 		}
 	}
 	return c
 }
 
 func (c *Controller) IsReady() bool { return c.ready }
-func (c *Controller) checkRoot() error {
-	if !c.ready {
+
+func (c *Controller) checkPrivileges() error {
+	if os.Geteuid() != 0 {
 		return fmt.Errorf("root required: run with sudo for block/throttle")
+	}
+	if c.iptablesPath == "" {
+		return fmt.Errorf("iptables is required but was not found")
+	}
+	if c.stateDir == "" {
+		return fmt.Errorf("state directory is not configured")
 	}
 	return nil
 }
 
-func (c *Controller) initQdisc() error {
-	exec.Command("tc", "qdisc", "del", "dev", c.iface, "root").Run()
-	exec.Command("tc", "class", "del", "dev", c.iface, "parent", htbHandle, "classid", defaultClass).Run()
-
-	if err := exec.Command("tc", "qdisc", "add", "dev", c.iface,
-		"root", "handle", htbHandle, "htb", "default", "10").Run(); err != nil {
-		if err2 := exec.Command("tc", "qdisc", "replace", "dev", c.iface,
-			"root", "handle", htbHandle, "htb", "default", "10").Run(); err2 != nil {
-			return err2
+func findExecutable(name string) string {
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	for _, dir := range []string{"/usr/sbin", "/sbin", "/usr/bin", "/bin"} {
+		p := filepath.Join(dir, name)
+		if info, err := os.Stat(p); err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0 {
+			return p
 		}
 	}
+	return ""
+}
 
-	return exec.Command("tc", "class", "add", "dev", c.iface,
+func runCommand(path string, args ...string) error {
+	out, err := exec.Command(path, args...).CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg != "" {
+			return fmt.Errorf("%s %s: %w: %s", filepath.Base(path), strings.Join(args, " "), err, msg)
+		}
+		return fmt.Errorf("%s %s: %w", filepath.Base(path), strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+func (c *Controller) runTC(args ...string) error {
+	return runCommand(c.tcPath, args...)
+}
+
+func (c *Controller) outputTC(args ...string) (string, error) {
+	out, err := exec.Command(c.tcPath, args...).CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("tc %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
+func (c *Controller) runIPTables(args ...string) error {
+	return runCommand(c.iptablesPath, append([]string{"-w", "5"}, args...)...)
+}
+
+func (c *Controller) iptablesExists(args ...string) bool {
+	return exec.Command(c.iptablesPath, append([]string{"-w", "5"}, args...)...).Run() == nil
+}
+
+func (c *Controller) enableForwarding() error {
+	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0o644); err != nil {
+		return fmt.Errorf("enable IP forwarding: %w", err)
+	}
+	return nil
+}
+
+func (c *Controller) ensureQdisc() error {
+	if c.tcPath == "" {
+		return fmt.Errorf("tc not installed (iproute2 is required for throttle)")
+	}
+	if c.qdiscReady {
+		return nil
+	}
+	out, err := c.outputTC("qdisc", "show", "dev", c.iface)
+	if err != nil {
+		return err
+	}
+	root := rootQdiscLine(out)
+	if strings.Contains(root, "qdisc htb "+htbHandle) {
+		// We are the sole owner (CLI-wide lock): clear stale classes/filters
+		// left by a previous session before reusing the handle.
+		if err := c.runTC("qdisc", "del", "dev", c.iface, "root"); err != nil {
+			return err
+		}
+	} else if hasCustomQdisc(root) {
+		return fmt.Errorf("refusing to replace an existing custom qdisc on %s; remove it manually first", c.iface)
+	}
+
+	if err := c.runTC("qdisc", "replace", "dev", c.iface,
+		"root", "handle", htbHandle, "htb", "default", "10"); err != nil {
+		return err
+	}
+	if err := c.runTC("class", "add", "dev", c.iface,
 		"parent", htbHandle, "classid", defaultClass,
-		"htb", "rate", defaultRate).Run()
+		"htb", "rate", defaultRate); err != nil {
+		if err2 := c.runTC("class", "change", "dev", c.iface,
+			"parent", htbHandle, "classid", defaultClass,
+			"htb", "rate", defaultRate); err2 != nil {
+			return errors.Join(err, err2)
+		}
+	}
+	c.qdiscReady = true
+	return nil
+}
+
+func rootQdiscLine(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, " root") {
+			return line
+		}
+	}
+	return out
+}
+
+func hasCustomQdisc(out string) bool {
+	for _, marker := range []string{
+		"qdisc htb ", "qdisc hfsc ", "qdisc cbq ", "qdisc tbf ",
+		"qdisc netem ", "qdisc cake ", "qdisc ingress ",
+		"qdisc prio ", "qdisc mqprio ", "qdisc pfifo ",
+	} {
+		if strings.Contains(out, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Controller) removeQdisc() error {
+	if c.tcPath == "" {
+		return nil
+	}
+	out, err := c.outputTC("qdisc", "show", "dev", c.iface)
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(rootQdiscLine(out), "qdisc htb "+htbHandle) {
+		return nil
+	}
+	if err := c.runTC("qdisc", "del", "dev", c.iface, "root"); err != nil {
+		return err
+	}
+	c.qdiscReady = false
+	return nil
 }
 
 func (c *Controller) ThrottleDevice(dev *db.Device, speedKbps int) error {
-	if err := c.checkRoot(); err != nil {
+	if err := c.checkPrivileges(); err != nil {
 		return err
+	}
+	if dev == nil || dev.IP == "" || dev.MAC == "" {
+		return fmt.Errorf("device MAC/IP is empty")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	rule, hadRule := c.activeDevices[dev.MAC]
 	if speedKbps <= 0 {
-		c.stopARPSpoof(dev.IP)
-		return c.removeThrottle(dev)
+		target := dev.IP
+		if hadRule && rule.IP != "" {
+			target = rule.IP
+		}
+		spoofErr := c.stopSpoof(target, purposeThrottle)
+		tcErr := c.removeThrottle(dev)
+		if !c.hasActiveThrottleRules() {
+			// Clears both this process's last class and stale classes from a
+			// crashed session (safe: the CLI-wide lock guarantees sole owner).
+			if err := c.removeQdisc(); err != nil {
+				tcErr = errors.Join(tcErr, err)
+			}
+		}
+		return errors.Join(spoofErr, tcErr)
 	}
 
-	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
-	c.startARPSpoof(dev.IP)
-
-	// Catat IP lama SEBELUM getOrCreateRule menimpanya — filter tc terikat
-	// IP, jadi pindah IP (DHCP) harus membersihkan filter IP lama.
-	oldIP := ""
-	oldClass := 0
-	if r, ok := c.activeDevices[dev.MAC]; ok {
-		oldIP = r.IP
-		oldClass = r.ClassID
+	if err := c.enableForwarding(); err != nil {
+		return err
 	}
-	rule := c.getOrCreateRule(dev)
-	rule.SpeedLimit = speedKbps
+	if err := c.ensureQdisc(); err != nil {
+		return err
+	}
+
+	oldIP, oldClass := "", 0
+	if hadRule {
+		oldIP, oldClass = rule.IP, rule.ClassID
+	}
+	if oldIP != "" && oldIP != dev.IP {
+		if err := c.stopSpoof(oldIP, purposeThrottle); err != nil {
+			return fmt.Errorf("stop spoof for old IP %s: %w", oldIP, err)
+		}
+	}
+	if err := c.startSpoof(dev.IP, purposeThrottle); err != nil {
+		return err
+	}
+	rollbackSpoof := func() {
+		_ = c.stopSpoof(dev.IP, purposeThrottle)
+	}
+
+	rule = c.getOrCreateRule(dev)
+	newClass := rule.ClassID == 0
 	classID := rule.ClassID
 	if classID == 0 {
 		classID = c.nextClassID()
 		rule.ClassID = classID
 	}
-
+	classStr := fmt.Sprintf("1:%d", classID)
 	rate := fmt.Sprintf("%dkbit", speedKbps)
 	burst := fmt.Sprintf("%dkbit", speedKbps/10)
 	if speedKbps/10 < 4 {
 		burst = "4kbit"
 	}
-	classStr := fmt.Sprintf("1:%d", classID)
 
 	if oldIP != "" && oldIP != dev.IP && oldClass != 0 {
 		c.delThrottleFilters(oldIP, fmt.Sprintf("1:%d", oldClass))
 	}
-	// Hapus dulu filter yang mungkin sudah ada (re-throttle) supaya
-	// tidak menumpuk duplikat tiap panggilan.
+	// Remove a possible duplicate from a failed/repeated application first.
 	c.delThrottleFilters(dev.IP, classStr)
 
-	// Create the class; if it already exists (e.g. re-throttle in the watch mode
-	// after an IP change), class add fails and class change updates the rate.
-	exec.Command("tc", "class", "add", "dev", c.iface,
+	if err := c.runTC("class", "add", "dev", c.iface,
 		"parent", htbHandle, "classid", classStr,
-		"htb", "rate", rate, "ceil", rate, "burst", burst).Run()
-	exec.Command("tc", "class", "change", "dev", c.iface,
-		"parent", htbHandle, "classid", classStr,
-		"htb", "rate", rate, "ceil", rate, "burst", burst).Run()
-	exec.Command("tc", "filter", "add", "dev", c.iface,
-		"parent", htbHandle, "protocol", "ip", "prio", "1", "u32",
-		"match", "ip", "dst", dev.IP, "flowid", classStr).Run()
-	exec.Command("tc", "filter", "add", "dev", c.iface,
-		"parent", htbHandle, "protocol", "ip", "prio", "1", "u32",
-		"match", "ip", "src", dev.IP, "flowid", classStr).Run()
+		"htb", "rate", rate, "ceil", rate, "burst", burst); err != nil {
+		if err2 := c.runTC("class", "change", "dev", c.iface,
+			"parent", htbHandle, "classid", classStr,
+			"htb", "rate", rate, "ceil", rate, "burst", burst); err2 != nil {
+			if newClass {
+				rule.ClassID = 0
+			}
+			rollbackSpoof()
+			return errors.Join(err, err2)
+		}
+	}
+	for _, dir := range []string{"dst", "src"} {
+		if err := c.runTC("filter", "add", "dev", c.iface,
+			"parent", htbHandle, "protocol", "ip", "prio", "1", "u32",
+			"match", "ip", dir, dev.IP, "flowid", classStr); err != nil {
+			c.delThrottleFilters(dev.IP, classStr)
+			_ = c.runTC("class", "del", "dev", c.iface, "classid", classStr)
+			rule.ClassID = 0
+			rollbackSpoof()
+			return err
+		}
+	}
 
+	rule.SpeedLimit = speedKbps
 	return nil
 }
 
 func (c *Controller) delThrottleFilters(ip, classStr string) {
-	exec.Command("tc", "filter", "del", "dev", c.iface, "parent", htbHandle, "protocol", "ip", "prio", "1", "u32", "match", "ip", "dst", ip, "flowid", classStr).Run()
-	exec.Command("tc", "filter", "del", "dev", c.iface, "parent", htbHandle, "protocol", "ip", "prio", "1", "u32", "match", "ip", "src", ip, "flowid", classStr).Run()
+	for _, dir := range []string{"dst", "src"} {
+		_ = c.runTC("filter", "del", "dev", c.iface, "parent", htbHandle,
+			"protocol", "ip", "prio", "1", "u32",
+			"match", "ip", dir, ip, "flowid", classStr)
+	}
+}
+
+func (c *Controller) tcClassExists(classStr string) bool {
+	out, err := c.outputTC("class", "show", "dev", c.iface, "classid", classStr)
+	return err == nil && strings.TrimSpace(out) != ""
+}
+
+func (c *Controller) hasActiveThrottleRules() bool {
+	for _, r := range c.activeDevices {
+		if r.ClassID > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Controller) removeThrottle(dev *db.Device) error {
 	rule, ok := c.activeDevices[dev.MAC]
 	if !ok || rule.ClassID == 0 {
-		// No in-memory rule. tc state never survives across sessions anyway:
-		// initQdisc() deletes the root qdisc (and all classes/filters) at startup.
 		return nil
 	}
 	classStr := fmt.Sprintf("1:%d", rule.ClassID)
-	c.delThrottleFilters(dev.IP, classStr)
-	exec.Command("tc", "class", "del", "dev", c.iface, "classid", classStr).Run()
+	ip := dev.IP
+	if rule.IP != "" {
+		ip = rule.IP
+	}
+	c.delThrottleFilters(ip, classStr)
+	if c.tcClassExists(classStr) {
+		if err := c.runTC("class", "del", "dev", c.iface, "classid", classStr); err != nil {
+			return err
+		}
+	}
 	rule.SpeedLimit = 0
 	rule.ClassID = 0
 	return nil
 }
 
 func (c *Controller) BlockDevice(dev *db.Device) error {
-	if err := c.checkRoot(); err != nil {
+	if err := c.checkPrivileges(); err != nil {
 		return err
+	}
+	if dev == nil || dev.IP == "" || dev.MAC == "" {
+		return fmt.Errorf("device MAC/IP is empty")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	rule := c.getOrCreateRule(dev)
 	if rule.Blocked {
 		return nil
 	}
-	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
-	c.startARPSpoof(dev.IP)
-	for _, args := range [][]string{
-		{"iptables", "-A", "FORWARD", "-d", dev.IP, "-j", "DROP"},
-		{"iptables", "-A", "FORWARD", "-s", dev.IP, "-j", "DROP"},
-	} {
-		exec.Command(args[0], args[1:]...).Run()
+	if err := c.ensureChain(); err != nil {
+		return err
+	}
+	if err := c.enableForwarding(); err != nil {
+		return err
+	}
+	if err := c.startSpoof(dev.IP, purposeBlock); err != nil {
+		return err
+	}
+	rollback := func() {
+		_ = c.stopSpoof(dev.IP, purposeBlock)
+		_ = c.deleteChainRules(dev.IP)
+	}
+	if err := c.ensureChainRule("-d", dev.IP); err != nil {
+		rollback()
+		return err
+	}
+	if err := c.ensureChainRule("-s", dev.IP); err != nil {
+		rollback()
+		return err
 	}
 	rule.Blocked = true
 	return nil
 }
 
 func (c *Controller) UnblockDevice(dev *db.Device) error {
-	if err := c.checkRoot(); err != nil {
+	if err := c.checkPrivileges(); err != nil {
+		return err
+	}
+	if dev == nil || dev.IP == "" {
+		return fmt.Errorf("device IP is empty")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ruleErr := c.deleteChainRules(dev.IP)
+	legacyErr := c.removeLegacyForwardDropRules(dev.IP)
+	spoofErr := c.stopSpoof(dev.IP, purposeBlock)
+	if rule, ok := c.activeDevices[dev.MAC]; ok {
+		rule.Blocked = false
+	}
+	return errors.Join(ruleErr, legacyErr, spoofErr)
+}
+
+func (c *Controller) ensureChain() error {
+	if !c.iptablesExists("-S", firewallChain) {
+		if err := c.runIPTables("-N", firewallChain); err != nil {
+			return fmt.Errorf("create firewall chain: %w", err)
+		}
+	}
+	if !c.iptablesExists("-C", "FORWARD", "-j", firewallChain) {
+		if err := c.runIPTables("-I", "FORWARD", "1", "-j", firewallChain); err != nil {
+			return fmt.Errorf("attach firewall chain: %w", err)
+		}
+	}
+	return nil
+}
+
+func (c *Controller) ensureChainRule(dir, ip string) error {
+	if c.iptablesExists("-C", firewallChain, dir, ip, "-j", "DROP") {
+		return nil
+	}
+	return c.runIPTables("-A", firewallChain, dir, ip, "-j", "DROP")
+}
+
+func (c *Controller) deleteChainRules(ip string) error {
+	var errs []error
+	for _, dir := range []string{"-d", "-s"} {
+		for i := 0; i < 64; i++ {
+			if !c.iptablesExists("-C", firewallChain, dir, ip, "-j", "DROP") {
+				break
+			}
+			if err := c.runIPTables("-D", firewallChain, dir, ip, "-j", "DROP"); err != nil {
+				errs = append(errs, err)
+				break
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// RemoveForwardDropRules removes legacy rules created by older versions in
+// the FORWARD chain. New rules live in the dedicated NJANET chain.
+func (c *Controller) RemoveForwardDropRules(ip string) error {
+	if err := c.checkPrivileges(); err != nil {
 		return err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.stopARPSpoof(dev.IP)
-	// Delete the FORWARD DROP rules by IP even when this process has no in-memory
-	// rule (e.g. the device was blocked in a previous session) — the rules live in
-	// iptables, not in memory.
-	c.RemoveForwardDropRules(dev.IP)
-	if rule, ok := c.activeDevices[dev.MAC]; ok {
-		rule.Blocked = false
-	}
-	return nil
+	return c.removeLegacyForwardDropRules(ip)
 }
 
-// RemoveForwardDropRules deletes only the FORWARD DROP rules NjaNet itself
-// created for the given IP. Never flush whole chains: that would wipe other
-// firewall rules (ufw/firewalld, manual rules, ...).
-func (c *Controller) RemoveForwardDropRules(ip string) {
-	for _, args := range [][]string{
-		{"iptables", "-D", "FORWARD", "-d", ip, "-j", "DROP"},
-		{"iptables", "-D", "FORWARD", "-s", ip, "-j", "DROP"},
-	} {
-		exec.Command(args[0], args[1:]...).Run()
+func (c *Controller) removeLegacyForwardDropRules(ip string) error {
+	var errs []error
+	for _, dir := range []string{"-d", "-s"} {
+		for i := 0; i < 64; i++ {
+			if !c.iptablesExists("-C", "FORWARD", dir, ip, "-j", "DROP") {
+				break
+			}
+			if err := c.runIPTables("-D", "FORWARD", dir, ip, "-j", "DROP"); err != nil {
+				errs = append(errs, err)
+				break
+			}
+		}
 	}
+	return errors.Join(errs...)
 }
 
 func (c *Controller) Reset() error {
+	if err := c.checkPrivileges(); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Remove the qdisc (deletes all NjaNet tc classes/filters) and stop spoofing.
-	// iptables cleanup for individual devices is handled via RemoveForwardDropRules.
-	c.initQdisc()
-	for key, cmd := range c.spoofProcs {
-		cmd.Process.Kill()
-		cmd.Wait()
-		delete(c.spoofProcs, key)
+
+	errs := []error{
+		c.removeQdisc(),
+		c.cleanupFirewall(),
+		c.stopAllSpoofs(),
 	}
 	c.activeDevices = make(map[string]*DeviceRule)
-	return nil
+	return errors.Join(errs...)
+}
+
+func (c *Controller) cleanupFirewall() error {
+	var errs []error
+	for i := 0; i < 64; i++ {
+		if !c.iptablesExists("-C", "FORWARD", "-j", firewallChain) {
+			break
+		}
+		if err := c.runIPTables("-D", "FORWARD", "-j", firewallChain); err != nil {
+			errs = append(errs, err)
+			break
+		}
+	}
+	if c.iptablesExists("-S", firewallChain) {
+		if err := c.runIPTables("-F", firewallChain); err != nil {
+			errs = append(errs, err)
+		}
+		if err := c.runIPTables("-X", firewallChain); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (c *Controller) getOrCreateRule(dev *db.Device) *DeviceRule {
@@ -253,117 +533,4 @@ func (c *Controller) nextClassID() int {
 		}
 	}
 	return 99
-}
-
-// --- ARP Spoofing ---
-
-func (c *Controller) startARPSpoof(targetIP string) {
-	if c.gatewayIP == "" {
-		return
-	}
-
-	os.Setenv("PATH", os.Getenv("PATH")+":/usr/sbin:/sbin")
-	path, err := exec.LookPath("arpspoof")
-
-	if err != nil {
-		pySrc := `
-import socket, struct, time
-def arp(iface, sm, si, dm, di):
-    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
-    s.bind((iface, 0))
-    while True:
-        eth = struct.pack("!6s6sH",
-            bytes.fromhex(dm.replace(":","")),
-            bytes.fromhex(sm.replace(":","")), 0x0806)
-        a = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 2,
-            bytes.fromhex(sm.replace(":","")),
-            socket.inet_aton(si),
-            bytes.fromhex(dm.replace(":","")),
-            socket.inet_aton(di))
-        s.send(eth + a)
-        time.sleep(1)
-`
-		c1 := exec.Command("python3", "-c", pySrc+
-			fmt.Sprintf("arp(%q,%q,%q,%q,%q)",
-				c.iface, c.getMyMAC(), c.gatewayIP, c.getMAC(targetIP), targetIP))
-		c1.Start()
-		c.spoofProcs[targetIP+"_gw"] = c1
-
-		c2 := exec.Command("python3", "-c", pySrc+
-			fmt.Sprintf("arp(%q,%q,%q,%q,%q)",
-				c.iface, c.getMyMAC(), targetIP, c.getGatewayMAC(), c.gatewayIP))
-		c2.Start()
-		c.spoofProcs[targetIP+"_tgt"] = c2
-		return
-	}
-
-	c1 := exec.Command(path, "-i", c.iface, "-t", targetIP, c.gatewayIP)
-	if err := c1.Start(); err == nil {
-		c.spoofProcs[targetIP+"_gw"] = c1
-	}
-
-	c2 := exec.Command(path, "-i", c.iface, "-t", c.gatewayIP, targetIP)
-	if err := c2.Start(); err == nil {
-		c.spoofProcs[targetIP+"_tgt"] = c2
-	}
-}
-
-func (c *Controller) stopARPSpoof(targetIP string) {
-	for _, suffix := range []string{"_gw", "_tgt"} {
-		key := targetIP + suffix
-		if cmd, ok := c.spoofProcs[key]; ok {
-			cmd.Process.Kill()
-			cmd.Wait()
-			delete(c.spoofProcs, key)
-		}
-	}
-	exec.Command("arp", "-d", c.gatewayIP).Run()
-	exec.Command("arp", "-d", targetIP).Run()
-	exec.Command("ping", "-c", "1", "-W", "1", c.gatewayIP).Run()
-	exec.Command("ping", "-c", "1", "-W", "1", targetIP).Run()
-}
-
-func (c *Controller) getMyMAC() string {
-	data, err := os.ReadFile("/sys/class/net/" + c.iface + "/address")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(data))
-}
-
-func (c *Controller) getGatewayMAC() string {
-	data, err := os.ReadFile("/proc/net/arp")
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		f := strings.Fields(line)
-		if len(f) >= 4 && f[0] == c.gatewayIP {
-			return strings.ToUpper(f[3])
-		}
-	}
-	return ""
-}
-
-func (c *Controller) getMAC(ip string) string {
-	data, err := os.ReadFile("/proc/net/arp")
-	if err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			f := strings.Fields(line)
-			if len(f) >= 4 && f[0] == ip && f[3] != "(incomplete)" {
-				return strings.ToUpper(f[3])
-			}
-		}
-	}
-	exec.Command("ping", "-c", "1", "-W", "1", ip).Run()
-	data2, err := os.ReadFile("/proc/net/arp")
-	if err == nil {
-		for _, line := range strings.Split(string(data2), "\n") {
-			f := strings.Fields(line)
-			if len(f) >= 4 && f[0] == ip && f[3] != "(incomplete)" {
-				return strings.ToUpper(f[3])
-			}
-		}
-	}
-	return ""
 }

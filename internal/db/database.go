@@ -3,7 +3,6 @@ package db
 import (
 	"database/sql"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -12,23 +11,38 @@ import (
 
 type Database struct {
 	*sql.DB
-	path string
+	path  string
+	owner *stateOwner
 }
 
 func New(path string) (*Database, error) {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("create db dir: %w", err)
+	owner := ownerForPath(dir)
+	if err := ensureStateDir(dir, owner); err != nil {
+		return nil, err
+	}
+	if err := prepareDBFile(path, owner); err != nil {
+		return nil, err
 	}
 
 	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	// Keep SQLite writes deterministic within one process and keep the WAL
+	// open for the lifetime of the connection (its ownership is repaired for
+	// the invoking user). Cross-process access still uses WAL + busy timeout.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
-	d := &Database{DB: db, path: path}
+	d := &Database{DB: db, path: path, owner: owner}
 	if err := d.migrate(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	if err := secureStateFiles(path, owner); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("secure database files: %w (run once with sudo to repair ownership)", err)
 	}
 
 	return d, nil

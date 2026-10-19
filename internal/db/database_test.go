@@ -1,6 +1,7 @@
 package db
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -124,6 +125,55 @@ func TestSchedules(t *testing.T) {
 	list, _ = d.GetSchedules()
 	if len(list) != 0 {
 		t.Errorf("after remove got %d schedules, want 0", len(list))
+	}
+}
+
+func TestDatabaseFilesArePrivate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	dbPath := filepath.Join(dir, "njanet.db")
+	d, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+		t.Errorf("state dir mode = %o, want 700", perm)
+	}
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		info, err := os.Stat(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("%s mode = %o, want 600", p, perm)
+		}
+	}
+}
+
+func TestRefusesSymlinkedDatabase(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "state")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(base, "target.db")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "njanet.db")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(link); err == nil {
+		t.Fatal("New accepted a symlinked database")
 	}
 }
 

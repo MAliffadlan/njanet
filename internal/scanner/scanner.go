@@ -22,14 +22,11 @@ import (
 )
 
 type Scanner struct {
-	iface       *net.Interface
-	myIP        net.IP
-	subnet      *net.IPNet
-	vendorCache map[string]string
-	mu          sync.RWMutex
-	results     []*db.Device
-	devicesMu   sync.RWMutex
-	ouiDB       map[string]string
+	iface  *net.Interface
+	myIP   net.IP
+	subnet *net.IPNet
+	mu     sync.RWMutex
+	ouiDB  map[string]string
 }
 
 type ScanResult struct {
@@ -67,11 +64,10 @@ func New(ifaceName string) (*Scanner, error) {
 	}
 
 	return &Scanner{
-		iface:       iface,
-		myIP:        myIP,
-		subnet:      subnet,
-		vendorCache: make(map[string]string),
-		ouiDB:       make(map[string]string),
+		iface:  iface,
+		myIP:   myIP,
+		subnet: subnet,
+		ouiDB:  make(map[string]string),
 	}, nil
 }
 
@@ -674,6 +670,8 @@ func (s *Scanner) nmapARPScan(ctx context.Context, nmapPath string) ([]*db.Devic
 		return nil, err
 	}
 
+	// nmap greppable output looks like:
+	// Host: 192.168.1.5 (hostname)\tStatus: Up\tMAC Address: AA:BB:CC:DD:EE:FF (Vendor)
 	var devices []*db.Device
 	scanner := bufio.NewScanner(bytes.NewReader(output))
 	for scanner.Scan() {
@@ -682,39 +680,50 @@ func (s *Scanner) nmapARPScan(ctx context.Context, nmapPath string) ([]*db.Devic
 			continue
 		}
 
-		// Parse nmap greppable output
 		parts := strings.Split(line, "\t")
 		for _, part := range parts {
-			if strings.HasPrefix(part, "Host:") {
-				ipStr := strings.TrimSpace(strings.TrimPrefix(part, "Host:"))
-				ip := net.ParseIP(ipStr)
-				if ip == nil || ip.Equal(s.myIP) {
+			part = strings.TrimSpace(part)
+			if !strings.HasPrefix(part, "Host:") {
+				continue
+			}
+			hostFields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(part, "Host:")))
+			if len(hostFields) == 0 {
+				continue
+			}
+			ipStr := hostFields[0]
+			ip := net.ParseIP(ipStr)
+			if ip == nil || ip.Equal(s.myIP) {
+				continue
+			}
+
+			dev := &db.Device{
+				IP:        ipStr,
+				Online:    true,
+				LastSeen:  time.Now(),
+				FirstSeen: time.Now(),
+			}
+			if len(hostFields) > 1 {
+				dev.Hostname = strings.Trim(hostFields[1], "()")
+			}
+			for _, attr := range parts {
+				attr = strings.TrimSpace(attr)
+				if !strings.HasPrefix(attr, "MAC Address:") {
 					continue
 				}
-
-				dev := &db.Device{
-					IP:        ipStr,
-					Online:    true,
-					LastSeen:  time.Now(),
-					FirstSeen: time.Now(),
+				macFields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(attr, "MAC Address:")))
+				if len(macFields) > 0 {
+					dev.MAC = strings.ToUpper(macFields[0])
 				}
-
-				// Look for MAC in other parts
-				for _, p := range parts {
-					if strings.Contains(p, "MAC:") {
-						macPart := strings.TrimSpace(strings.TrimPrefix(p, "MAC:"))
-						if idx := strings.Index(macPart, " "); idx > 0 {
-							dev.MAC = strings.ToUpper(macPart[:idx])
-						} else {
-							dev.MAC = strings.ToUpper(macPart)
-						}
-					}
-				}
-
-				dev.Vendor = s.LookupVendor(dev.MAC)
-				dev.DeviceType = s.detectDeviceType(dev)
-				devices = append(devices, dev)
 			}
+			// nmap on a routed/non-root scan has no MAC; the ARP table
+			// fallback will find it if the host is on our L2 segment.
+			if dev.MAC == "" || !s.isValidMAC(dev.MAC) {
+				continue
+			}
+
+			dev.Vendor = s.LookupVendor(dev.MAC)
+			dev.DeviceType = s.detectDeviceType(dev)
+			devices = append(devices, dev)
 		}
 	}
 
@@ -755,6 +764,9 @@ func (s *Scanner) rawARPScan(ctx context.Context) ([]*db.Device, error) {
 			}
 			if !found {
 				mac := s.resolveMAC(ip)
+				if mac == "" || !s.isValidMAC(mac) {
+					continue
+				}
 				dev := &db.Device{
 					IP:        ip.String(),
 					MAC:       mac,
@@ -882,6 +894,9 @@ func (s *Scanner) quickPortScan(ctx context.Context, ip string) []int {
 }
 
 func (s *Scanner) detectWireless(mac string) bool {
+	if len(mac) < 8 {
+		return false
+	}
 	// Common wireless interface OUI prefixes
 	wirelessPrefixes := []string{
 		"00:1A:11", // Google/Nest
@@ -1164,6 +1179,17 @@ func (s *Scanner) Scan(ctx context.Context) (*ScanResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("arp scan: %w", err)
 	}
+
+	// Devices without a valid MAC cannot be keyed in the database and used
+	// to panic the enrichment path. Drop them before doing any work.
+	validARP := arpDevices[:0]
+	for _, dev := range arpDevices {
+		if dev.MAC == "" || !s.isValidMAC(dev.MAC) {
+			continue
+		}
+		validARP = append(validARP, dev)
+	}
+	arpDevices = validARP
 
 	// 2. Enrich each device
 	var wg sync.WaitGroup

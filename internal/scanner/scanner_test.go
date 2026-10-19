@@ -1,8 +1,13 @@
 package scanner
 
 import (
+	"context"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/mectov/njanet/internal/db"
 )
 
 func testScanner(cidr, myIP string) *Scanner {
@@ -70,5 +75,48 @@ func TestNetworkHostsRespectsSubnet(t *testing.T) {
 		if !s.subnet.Contains(ip) {
 			t.Fatalf("%s outside subnet", ip)
 		}
+	}
+}
+
+func TestNmapGreppableParsing(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "nmap")
+	script := `#!/bin/sh
+printf 'Host: 192.168.1.5\tStatus: Up\n'
+printf 'Host: 192.168.1.6 (phone.lan)\tStatus: Up\tMAC Address: 11:22:33:44:55:66 (Acme)\n'
+printf 'Host: 192.168.1.7\tStatus: Up\tMAC Address: AA:BB:CC:DD:EE:FF (Vendor)\n'
+`
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := testScanner("192.168.1.0/24", "192.168.1.10")
+	s.ouiDB = map[string]string{"112233": "Acme", "AABBCC": "Vendor"}
+
+	devices, err := s.nmapARPScan(context.Background(), fake)
+	if err != nil {
+		t.Fatalf("nmapARPScan: %v", err)
+	}
+	if len(devices) != 2 {
+		t.Fatalf("got %d devices, want 2 (host without MAC must be skipped)", len(devices))
+	}
+	got := make(map[string]*db.Device)
+	for _, d := range devices {
+		got[d.IP] = d
+	}
+	if d := got["192.168.1.6"]; d == nil || d.MAC != "11:22:33:44:55:66" || d.Hostname != "phone.lan" {
+		t.Errorf("named host parsed as %+v", d)
+	}
+	if d := got["192.168.1.7"]; d == nil || d.MAC != "AA:BB:CC:DD:EE:FF" {
+		t.Errorf("unnamed host parsed as %+v", d)
+	}
+}
+
+func TestDetectWirelessEmptyMAC(t *testing.T) {
+	s := &Scanner{}
+	if s.detectWireless("") {
+		t.Fatal("empty MAC must not be reported as wireless")
+	}
+	if s.detectWireless("AA:BB") {
+		t.Fatal("short MAC must not be reported as wireless")
 	}
 }

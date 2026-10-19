@@ -44,7 +44,7 @@ Diperlukan:
 ```bash
 git clone https://github.com/MAliffadlan/njanet
 cd njanet
-go build -o njanet cmd/njanet/main.go
+go build -o njanet ./cmd/njanet
 sudo cp njanet /usr/local/bin/
 ```
 
@@ -175,6 +175,7 @@ Throttle / Block:
 | VPN | Tidak berfungsi |
 | Laptop mati / suspend | Throttle ikut mati |
 | Perangkat restart | Tanpa `--watch`, aturan hilang |
+| Dua perintah pengubah aturan bersamaan | Ditolak; hentikan proses aktif dulu (Ctrl+C) |
 
 ## **8. Troubleshooting**
 

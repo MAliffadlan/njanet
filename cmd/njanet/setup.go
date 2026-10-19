@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/mectov/njanet/internal/controller"
@@ -33,7 +34,7 @@ func initScanner(ifaceName string) *scanner.Scanner {
 }
 
 func initController(ifaceName string) *controller.Controller {
-	return controller.New(ifaceName, getMyIP(ifaceName), getGatewayIP())
+	return controller.New(ifaceName, getGatewayIP(), filepath.Dir(dbPath))
 }
 
 func autoDetectInterface() string {

@@ -172,6 +172,8 @@ KETERANGAN
   Window boleh lewat tengah malam (22:00-06:00). Di luar window
   perangkat dipulihkan otomatis. Daemon wajib jalan agar aturan
   ditegakkan; jadwal baru otomatis kepakai tanpa restart.
+  Selama daemon jalan, perintah pengubah aturan lain (throttle,
+  block, hog, reset) ditolak — hentikan daemon dulu.
 
 CONTOH
   njanet sched add 192.168.1.8 block 00:00-06:00

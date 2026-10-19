@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -141,26 +140,32 @@ func schedAdd(ifaceName string) {
 }
 
 // resolveSchedTarget turns an IP or MAC into a (MAC, IP) pair.
-// IP may be empty when the device is currently offline.
+// An IP target must be confirmed by the current ARP table: falling back to a
+// stale DB row could schedule an innocent device that received the IP later.
+// IP may be empty for MAC targets that are currently offline.
 func resolveSchedTarget(target string, database *db.Database) (mac, ip string) {
 	if !isValidIP(target) && !isValidMAC(target) {
 		fmt.Fprintf(os.Stderr, "IP atau MAC tidak valid: %s\n", target)
 		os.Exit(1)
 	}
-	if dev := findDevice(target, database); dev != nil && dev.MAC != "" {
-		return strings.ToUpper(dev.MAC), dev.IP
-	}
 	if isValidIP(target) {
 		m := resolveMAC(target)
-		if m != "" {
-			database.UpsertDevice(&db.Device{MAC: m, IP: target})
-			return m, target
+		if m == "" {
+			return "", ""
 		}
-		return "", ""
+		database.UpsertDevice(&db.Device{MAC: m, IP: target})
+		return m, target
 	}
-	// MAC given but unknown/offline — accept it, daemon applies when seen.
 	m := strings.ToUpper(target)
-	return m, resolveIPByMAC(m)
+	ip = resolveIPByMAC(m)
+	if ip == "" {
+		// DB IP is for display only; the daemon never enforces a MAC target
+		// unless that MAC is currently visible in ARP.
+		if dev := findDevice(m, database); dev != nil {
+			ip = dev.IP
+		}
+	}
+	return m, ip
 }
 
 // --- remove ---
@@ -191,10 +196,12 @@ func schedRemove() {
 	if isValidMAC(arg) {
 		mac = strings.ToUpper(arg)
 	} else if isValidIP(arg) {
-		if m, err := database.FindMACByIP(arg); err == nil && m != "" {
-			mac = m
-		} else {
-			mac = resolveMAC(arg)
+		// Prefer the live ARP entry; the DB may still map the IP to an old MAC.
+		mac = resolveMAC(arg)
+		if mac == "" {
+			if m, err := database.FindMACByIP(arg); err == nil {
+				mac = m
+			}
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "Argumen tidak valid: %s (pakai id, IP, atau MAC)\n", arg)
@@ -277,6 +284,7 @@ type appliedSched struct {
 	action string
 	speed  int
 	ip     string
+	mac    string
 }
 
 func cmdSchedRun(ifaceName string) {
@@ -295,35 +303,29 @@ func cmdSchedRun(ifaceName string) {
 	database := initDB()
 	defer database.Close()
 
+	unlock, err := acquireControllerLock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		os.Exit(1)
+	}
+	defer unlock()
+
 	ctrl := initController(ifaceName)
 	if !ctrl.IsReady() {
 		fmt.Fprintln(os.Stderr, "❌ Root required: jalankan dengan sudo (butuh tc + iptables)")
 		os.Exit(1)
 	}
 
-	// Satu daemon saja — cegah dua proses saling menimpa aturan.
-	pidPath := filepath.Join(filepath.Dir(dbPath), "sched.pid")
-	pf, err := os.OpenFile(pidPath, os.O_CREATE|os.O_RDWR, 0644)
+	schedules, err := database.GetSchedules()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Gagal buka pidfile: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Gagal baca jadwal: %v\n", err)
 		os.Exit(1)
 	}
-	defer pf.Close()
-	if err := syscall.Flock(int(pf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		fmt.Fprintln(os.Stderr, "❌ Scheduler sudah berjalan. Hentikan dulu sebelum start lagi.")
-		os.Exit(1)
-	}
-	pf.Truncate(0)
-	pf.WriteString(strconv.Itoa(os.Getpid()))
-	pf.Sync()
-	defer os.Remove(pidPath)
-
-	schedules, _ := database.GetSchedules()
 	fmt.Printf("⏰ Scheduler jalan (%d jadwal, cek tiap %s, Ctrl+C = stop + pulihkan)\n", len(schedules), every)
 	fmt.Println("   Jadwal baru/revisi otomatis kepakai tanpa restart daemon.")
 	fmt.Println()
 
-	applied := make(map[string]appliedSched)
+	applied := make(map[int64]appliedSched)
 	unknown := make(map[string]bool)
 	selfWarned := make(map[string]bool)
 
@@ -336,26 +338,30 @@ func cmdSchedRun(ifaceName string) {
 			fmt.Fprintf(os.Stderr, "[%s] db error: %v\n", ts(), err)
 			return
 		}
+		present := make(map[int64]bool, len(schedules))
 		for _, sc := range schedules {
+			present[sc.ID] = true
 			want := dayMatches(sc.Days, now) && inWindow(sc.StartMin, sc.EndMin, nowMin)
 
 			resolved := resolveIPByMAC(sc.MAC)
 			ip := resolved
-			if ip == "" {
-				ip = sc.IP
-			}
 			if resolved != "" && resolved != sc.IP {
-				database.UpdateScheduleIP(sc.MAC, resolved)
+				if err := database.UpdateScheduleIP(sc.MAC, resolved); err != nil {
+					fmt.Fprintf(os.Stderr, "[%s] db error update IP #%d: %v\n", ts(), sc.ID, err)
+				}
 			}
 
-			cur, ok := applied[sc.MAC]
+			cur, ok := applied[sc.ID]
 
 			// Target ternyata IP sendiri/gateway (mis. ganti jaringan):
 			// jangan pernah terapkan, bersihkan bila sempat teraplikasi.
-			if ip == myIP || ip == gwIP {
+			if ip != "" && (ip == myIP || ip == gwIP) {
 				if ok {
-					revertSched(ctrl, database, sc.MAC, cur)
-					delete(applied, sc.MAC)
+					if err := revertSched(ctrl, database, cur); err != nil {
+						fmt.Fprintf(os.Stderr, "[%s] gagal mencabut jadwal #%d: %v\n", ts(), sc.ID, err)
+						continue
+					}
+					delete(applied, sc.ID)
 				}
 				if !selfWarned[sc.MAC] {
 					fmt.Printf("[%s] ⏭️  Jadwal #%d menunjuk %s (perangkat sendiri/gateway) — dilewati\n",
@@ -368,9 +374,14 @@ func cmdSchedRun(ifaceName string) {
 
 			if want && ip == "" {
 				// Perangkat hilang dari jaringan — bersihkan aturan basi.
+				// Jangan pernah memakai sc.IP: IP itu bisa sudah dipakai
+				// perangkat lain setelah DHCP lease berakhir.
 				if ok {
-					revertSched(ctrl, database, sc.MAC, cur)
-					delete(applied, sc.MAC)
+					if err := revertSched(ctrl, database, cur); err != nil {
+						fmt.Fprintf(os.Stderr, "[%s] gagal mencabut aturan basi #%d: %v\n", ts(), sc.ID, err)
+						continue
+					}
+					delete(applied, sc.ID)
 				}
 				if !unknown[sc.MAC] {
 					fmt.Printf("[%s] ⏳ %s belum terlihat di jaringan — menunggu...\n", ts(), sc.MAC)
@@ -383,24 +394,45 @@ func cmdSchedRun(ifaceName string) {
 			if want {
 				if !ok || cur.action != sc.Action || cur.speed != sc.SpeedKbps || cur.ip != ip {
 					if ok {
-						revertSched(ctrl, database, sc.MAC, cur)
+						if err := revertSched(ctrl, database, cur); err != nil {
+							fmt.Fprintf(os.Stderr, "[%s] gagal mencabut aturan lama #%d: %v\n", ts(), sc.ID, err)
+							continue
+						}
+						delete(applied, sc.ID)
 					}
 					if err := applySched(ctrl, database, sc, ip); err != nil {
 						fmt.Fprintf(os.Stderr, "[%s] ⚠️  Gagal terapkan jadwal #%d ke %s: %v (coba lagi tick berikut)\n",
 							ts(), sc.ID, ip, err)
 						continue
 					}
-					applied[sc.MAC] = appliedSched{action: sc.Action, speed: sc.SpeedKbps, ip: ip}
+					applied[sc.ID] = appliedSched{action: sc.Action, speed: sc.SpeedKbps, ip: ip, mac: sc.MAC}
 					fmt.Printf("[%s] #%d %s → %s (%s)\n", ts(), sc.ID, describeSched(sc), ip, sc.MAC)
 				}
 				continue
 			}
 
 			if ok {
-				revertSched(ctrl, database, sc.MAC, cur)
-				delete(applied, sc.MAC)
-				fmt.Printf("[%s] #%d window selesai — %s (%s) dipulihkan\n", ts(), sc.ID, cur.ip, sc.MAC)
+				if err := revertSched(ctrl, database, cur); err != nil {
+					fmt.Fprintf(os.Stderr, "[%s] gagal memulihkan jadwal #%d: %v\n", ts(), sc.ID, err)
+					continue
+				}
+				delete(applied, sc.ID)
+				fmt.Printf("[%s] #%d window selesai — %s (%s) dipulihkan\n", ts(), sc.ID, cur.ip, cur.mac)
 			}
+		}
+
+		// Jadwal yang dihapus saat daemon berjalan tidak akan dikunjungi lagi
+		// oleh loop di atas; cabut aturannya di sini.
+		for id, cur := range applied {
+			if present[id] {
+				continue
+			}
+			if err := revertSched(ctrl, database, cur); err != nil {
+				fmt.Fprintf(os.Stderr, "[%s] gagal mencabut jadwal #%d yang dihapus: %v\n", ts(), id, err)
+				continue
+			}
+			delete(applied, id)
+			fmt.Printf("[%s] Jadwal #%d dihapus — %s (%s) dipulihkan\n", ts(), id, cur.ip, cur.mac)
 		}
 	}
 
@@ -417,10 +449,12 @@ func cmdSchedRun(ifaceName string) {
 			tick()
 		case <-sig:
 			fmt.Println("\n🔄 Memulihkan semua perangkat terjadwal...")
-			for mac, cur := range applied {
-				revertSched(ctrl, database, mac, cur)
+			for id, cur := range applied {
+				if err := revertSched(ctrl, database, cur); err != nil {
+					fmt.Fprintf(os.Stderr, "Gagal memulihkan jadwal #%d (%s): %v\n", id, cur.ip, err)
+				}
 			}
-			fmt.Println("✅ Scheduler berhenti, jaringan dipulihkan")
+			fmt.Println("✅ Scheduler berhenti")
 			return
 		}
 	}
@@ -440,15 +474,18 @@ func applySched(ctrl *controller.Controller, database *db.Database, sc *db.Sched
 	return database.UpdateDeviceSpeed(sc.MAC, sc.SpeedKbps)
 }
 
-func revertSched(ctrl *controller.Controller, database *db.Database, mac string, cur appliedSched) {
-	dev := &db.Device{MAC: mac, IP: cur.ip}
+func revertSched(ctrl *controller.Controller, database *db.Database, cur appliedSched) error {
+	dev := &db.Device{MAC: cur.mac, IP: cur.ip}
 	if cur.action == "block" {
-		ctrl.UnblockDevice(dev)
-		database.UpdateDeviceBlock(mac, false)
-		return
+		if err := ctrl.UnblockDevice(dev); err != nil {
+			return err
+		}
+		return database.UpdateDeviceBlock(cur.mac, false)
 	}
-	ctrl.ThrottleDevice(dev, 0)
-	database.UpdateDeviceSpeed(mac, 0)
+	if err := ctrl.ThrottleDevice(dev, 0); err != nil {
+		return err
+	}
+	return database.UpdateDeviceSpeed(cur.mac, 0)
 }
 
 func describeSched(sc *db.Schedule) string {
